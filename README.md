@@ -169,6 +169,25 @@ The above design solves two problems one being we're able to inherit from Qemu X
 
 The above code solves the lack of BusMaster capability on AMD IOMMU by writing interrupts directly to system address space
 
-Lastly, the Platform device issue was solved by affiliating x86 MSI route
+Lastly, the Platform device issue was solved by affiliating x86 MSI route which was initially
+
+     struct MSIRouteEntry {
+         PCIDevice *dev;             /* Device pointer */
+         int vector;                 /* MSI/MSIX vector index */
+         int virq;                   /* Virtual IRQ index */
+        QLIST_ENTRY(MSIRouteEntry) list;
+      };
+
+to
+
+     struct MSIRouteEntry {
+         PCIDevice *dev;             /* Device pointer */
+         uint16_t requester_id;      /* Requesting SID */
+         int vector;                 /* MSI/MSIX vector index */
+         int virq;                   /* Virtual IRQ index */
+        QLIST_ENTRY(MSIRouteEntry) list;
+      };
+
+with a Requester ID which ensures that IOAPIC triggering interrupts in split irqchip mode is able to tell the IOMMU it's SID.
 
 _And may be something else I forgot ?_
