@@ -22,25 +22,25 @@ This didn't turn out *so* easy.
 
 ##how come?!?
 
--IOMMU masquerades as a PCI device by stealing PCI config space so that the Software driver is able to communicate with it as with any other PCI device while it's not really a PCI device.
+1 IOMMU masquerades as a PCI device by stealing PCI config space so that the Software driver is able to communicate with it as with     any other PCI device while it's not really a PCI device.
 
-_3.1 PCI Resources_ 
+   _3.1 PCI Resources_ 
 
   _The IOMMU is implemented as an independent PCI Function. Any PCI Function containing an IOMMU capability block cannot be used for any purpose other than containing an IOMMU. A PCI Function containing an IOMMU capability block does not include PCI BAR registers. Configuration and status information for the IOMMU are mapped into PCI configuration space using a PCI capability block._"  - *AMD IOMMU Spec*
 
-(Someone actually pointed this out, for me ;-p)
+  (Someone actually pointed this out, for me ;-p)
 
-The above becomes evident since IOMMU reserves MMIO region without a BAR register. This feature was particularly hard to emulate in Qemu since it only supports either purely PCI devices or platform devices(system bus devices).
+  The above becomes evident since IOMMU reserves MMIO region without a BAR register. This feature was particularly hard to emulate in Qemu since it only supports either purely PCI devices or platform devices(system bus devices).
 
--AMD IOMMU, while masquerading as a PCI device generates interrupts without being a BusMaster device(which is typical of PCI devices)
+2. AMD IOMMU, while masquerading as a PCI device generates interrupts without being a BusMaster device(which is typical of PCI devices)
 
-![](http://hotpepper.co.ke/content/images/2016/08/busmaster-3.png)
+                  ![](http://hotpepper.co.ke/content/images/2016/08/busmaster-3.png)
 
-IOMMU should generate an interrupt each time it logs an event which should include all hardware errors and page faults.
+   IOMMU should generate an interrupt each time it logs an event which should include all hardware errors and page faults.
 
--IOMMUs(including AMD IOMMU) use device source ID (which should be same as BDF) to index _device table_ and other informational data structures in-order to make decisions on access rights and remap interrupts. Platform devices like HPET and IOAPIC don't make DMA requests, at least as long as Qemu is concerned which means that the DMA part of IOMMU can be completed without any problem. These devices are however major interrupt sources in a system which means the interrupt remapping work is a bit tricky. Interrupt requests should be accompanied by information identifying the device and the nature of the interrupt requests. Included in this information is the Requester ID which is basically the Bus Device Function(BDF) when PCI devices are concerned. Platform devices which want to make interrupt requests should report the BDF that will accompany their interrupt requests. The problem comes in because platform devices, in Qemu currently make interrupt requests using unspecified attributes meaning unspecified requester ID.
+3. IOMMUs(including AMD IOMMU) use device source ID (which should be same as BDF) to index _device table_ and other informational data    structures in-order to make decisions on access rights and remap interrupts. Platform devices like HPET and IOAPIC don't make         DMArequests, at least as long as Qemu is concerned which means that the DMA part of IOMMU can be completed without any problem.       These devices are however major interrupt sources in a system which means the interrupt remapping work is a bit tricky. Interrupt     requests should be accompanied by information identifying the device and the nature of the interrupt requests. Included in this       information is the Requester ID which is basically the Bus Device Function(BDF) when PCI devices are concerned. Platform devices      which want to make interrupt requests should report the BDF that will accompany their interrupt requests. The problem comes in        because platform devices, in Qemu currently make interrupt requests using unspecified attributes meaning unspecified requester ID.
 
-_huh_ ? _sounds like AMD is hating on Qemu_
+   _huh_ ? _sounds like AMD is hating on Qemu_
 
 The working Qemu AMD IOMMU setup implements a composite PCI/Platform device similar to the stripped down device below.
 
@@ -154,8 +154,6 @@ The working Qemu AMD IOMMU setup implements a composite PCI/Platform device simi
     type_init(amdviPCI_register_types);
 
 The above design solves two problems one being we're able to inherit from Qemu X86 IOMMU class (which is implemented as Platform device) and the other being we're able to reserve MMIO region for like any other Platform device hence avoiding the need for a BAR register.
-
-'''C
 
      static void amdvi_generate_msi_interrupt(AMDVIState *s)
      {
