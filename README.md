@@ -188,4 +188,14 @@ with a MSI Requester ID to have
 
 which ensures that IOAPIC triggering interrupts in split irqchip mode is able to tell the IOMMU it's SID and so would any other platform device.
 
+##Why spend all this effort on a seemingly useless device ?
+
+##Good Question
+
+Interrupt remapping as an IOMMU feature enables interception, validation and delivery interrupts to specific CPUs. Interrupt remapping together with interrupt virtualization could bring performance improvements to guest VM but interrupt remapping alone is supposed to provide device isolation, compatibility with x2apic and could possibly be used to program a different route for delivery of an interrupt.
+
+Device isolation allows the handing over of device to unprivileged users since with the validation of interrupts a device controlled by, say, a malicious user cannot be able to generate spurious interrupts (which is possible by just writing to MSI region) and direct them to arbitrary CPUs.This allows safe development of device drivers from userspace but could not be done with the IOMMU models with don't allow for interrupt remapping where one requires supervisor rights to passthrough devices which is not necessary with interrupt remapping.
+
+It’s a requirement from intel that with x2apic enabled peripheral interrupts should be delivered through interrupt remapping and lastly It _could_ be possible to reroute interrupts without reconfiguring the interrupt source by modifying the Interrupt remapping table since it contains all the information relating to routing interrupts related to a certain device. This could avoid the messy process of rerouting interrupts.
+
 _And may be something else I forgot ?_
