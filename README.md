@@ -20,7 +20,7 @@ IOMMU is a device that sits between host bridge and peripherals allowing them to
 
 This didn't turn out *so* easy.
 
-**how come?!?**
+***how come?!?***
 
 -IOMMU masquerades as a PCI device by stealing PCI config space so that the Software driver is able to communicate with it as with any other PCI device while it's not really a PCI device.
 
@@ -67,15 +67,13 @@ The working Qemu AMD IOMMU setup implements a composite PCI/Platform device simi
        OBJECT_CHECK(AMDVIPCIState, (obj), TYPE_AMD_IOMMU_PCI)
 
     typedef struct AMDVIPCIState {
-       PCIDevice dev;
-       /* PCI specific properties */
-       uint8_t *capab;              /* capabilities registers       */
+       PCIDevice dev;               /* PCI specific properties      */
        uint32_t capab_offset;       /* capability offset pointer    */
     } AMDVIPCIState;
 
     typedef struct AMDVIState {
-        X86IOMMUState iommu;        /* IOMMU bus device             */
-        AMDVIPCIState *dev;         /* IOMMU PCI device             */
+       X86IOMMUState iommu;        /* IOMMU bus device             */
+       AMDVIPCIState *dev;         /* IOMMU PCI device             */
 
        uint8_t mmior[AMDVI_MMIO_SIZE];    /* read/write MMIO              */
        uint8_t w1cmask[AMDVI_MMIO_SIZE];  /* read/write 1 clear mask      */
@@ -104,7 +102,7 @@ The working Qemu AMD IOMMU setup implements a composite PCI/Platform device simi
          /* This device should take care of IOMMU PCI properties */
          PCIDevice *createddev = pci_create_simple(bus, -1, TYPE_AMD_IOMMU_PCI);
          AMDVIPCIState *amdpcidevice = container_of(createddev, AMDVIPCIState, dev);
-        s->dev = amdpcidevice;
+         s->dev = amdpcidevice;
     }
 
     static void amdvi_class_init(ObjectClass *klass, void* data)
@@ -128,10 +126,10 @@ The working Qemu AMD IOMMU setup implements a composite PCI/Platform device simi
          AMDVIPCIState *s = container_of(dev, AMDVIPCIState, dev);
 
          /* we need to report certain PCI capabilities */
-        s->capab_offset = pci_add_capability(&s->dev, AMDVI_CAPAB_ID_SEC, 0,
-                                        AMDVI_CAPAB_SIZE);
-        pci_add_capability(&s->dev, PCI_CAP_ID_MSI, 0, AMDVI_CAPAB_REG_SIZE);
-        pci_add_capability(&s->dev, PCI_CAP_ID_HT, 0, AMDVI_CAPAB_REG_SIZE);
+         s->capab_offset = pci_add_capability(&s->dev, AMDVI_CAPAB_ID_SEC, 0,
+                                              AMDVI_CAPAB_SIZE);
+         pci_add_capability(&s->dev, PCI_CAP_ID_MSI, 0, AMDVI_CAPAB_REG_SIZE);
+         pci_add_capability(&s->dev, PCI_CAP_ID_HT, 0, AMDVI_CAPAB_REG_SIZE);
     } 
 
     static void amdviPCI_class_init(ObjectClass *klass, void* data)
