@@ -1,0 +1,3118 @@
+0bdc6bc36fadc15dac013c59687060db74510219 - David Kiarie, Mon Aug 15 12:14:19 2016 +0300 : hw/iommu: share common code between IOMMUs
+diff --git a/hw/i386/intel_iommu.c b/hw/i386/intel_iommu.c
+index e4bad6a..bf86dcc 100644
+--- a/hw/i386/intel_iommu.c
++++ b/hw/i386/intel_iommu.c
+@@ -30,7 +30,6 @@
+ #include "hw/boards.h"
+ #include "hw/i386/x86-iommu.h"
+ #include "hw/pci-host/q35.h"
+-#include "sysemu/kvm.h"
+ 
+ /*#define DEBUG_INTEL_IOMMU*/
+ #ifdef DEBUG_INTEL_IOMMU
+@@ -2472,14 +2471,6 @@ static void vtd_realize(DeviceState *dev, Error **errp)
+                             Q35_PSEUDO_DEVFN_IOAPIC);
+     /* Pseudo address space under root PCI bus. */
+     pcms->ioapic_as = vtd_host_dma_iommu(bus, s, Q35_PSEUDO_DEVFN_IOAPIC);
+-
+-    /* Currently Intel IOMMU IR only support "kernel-irqchip={off|split}" */
+-    if (x86_iommu->intr_supported && kvm_irqchip_in_kernel() &&
+-        !kvm_irqchip_is_split()) {
+-        error_report("Intel Interrupt Remapping cannot work with "
+-                     "kernel-irqchip=on, please use 'split|off'.");
+-        exit(1);
+-    }
+ }
+ 
+ static void vtd_class_init(ObjectClass *klass, void *data)
+diff --git a/hw/i386/x86-iommu.c b/hw/i386/x86-iommu.c
+index 2278af7..66510f7 100644
+--- a/hw/i386/x86-iommu.c
++++ b/hw/i386/x86-iommu.c
+@@ -21,6 +21,7 @@
+ #include "hw/sysbus.h"
+ #include "hw/boards.h"
+ #include "hw/i386/x86-iommu.h"
++#include "sysemu/kvm.h"
+ #include "qemu/error-report.h"
+ #include "trace.h"
+ 
+@@ -84,6 +85,13 @@ static void x86_iommu_realize(DeviceState *dev, Error **errp)
+     if (x86_class->realize) {
+         x86_class->realize(dev, errp);
+     }
++    /* Currently IOMMU IR only support "kernel-irqchip={off|split}" */
++    if (x86_iommu->intr_supported && kvm_irqchip_in_kernel() &&
++        !kvm_irqchip_is_split()) {
++        error_report("Interrupt Remapping cannot work with "
++                     "kernel-irqchip=on, please use 'split|off'.");
++        exit(1);
++    }
+ 
+     x86_iommu_set_default(X86_IOMMU_DEVICE(dev));
+ }
+
+060f06c13d4e08fb3f0cd7137e1c688b0a9cfa65 - David Kiarie, Wed Aug 10 21:27:45 2016 +0300 : hw/acpi: report IOAPIC on IVRS
+diff --git a/hw/i386/acpi-build.c b/hw/i386/acpi-build.c
+index 49bd183..c2559ff 100644
+--- a/hw/i386/acpi-build.c
++++ b/hw/i386/acpi-build.c
+@@ -2615,6 +2615,8 @@ build_amd_iommu(GArray *table_data, BIOSLinker *linker)
+      *   Refer to Spec - Table 95:IVHD Device Entry Type Codes(4-byte)
+      */
+     build_append_int_noprefix(table_data, 0x0000001, 4);
++    /* IOAPIC represented as an 8-byte entry. Spec v2.62 Tables 97 */
++    build_append_int_noprefix(table_data, 0x0100a000cf000048, 8);
+ 
+     build_header(linker, table_data, (void *)(table_data->data + iommu_start),
+                  "IVRS", table_data->len - iommu_start, 1, NULL, NULL);
+
+3334b1d8d3082704f3945c2514a668bc0cae4ece - David Kiarie, Mon Aug 15 18:20:27 2016 +0300 : hw/iommu: AMD IOMMU interrupt remapping
+diff --git a/hw/i386/amd_iommu.c b/hw/i386/amd_iommu.c
+index 19da365..08d6dae 100644
+--- a/hw/i386/amd_iommu.c
++++ b/hw/i386/amd_iommu.c
+@@ -18,11 +18,10 @@
+  * with this program; if not, see <http://www.gnu.org/licenses/>.
+  *
+  * Cache implementation inspired by hw/i386/intel_iommu.c
++ *
+  */
+ #include "qemu/osdep.h"
+-#include <math.h>
+-#include "hw/pci/msi.h"
+-#include "hw/i386/pc.h"
++#include "qemu/error-report.h"
+ #include "hw/i386/amd_iommu.h"
+ #include "hw/pci/pci_bus.h"
+ #include "trace.h"
+@@ -270,6 +269,31 @@ typedef struct QEMU_PACKED {
+ #endif /* __BIG_ENDIAN_BITFIELD */
+ } CMDCompletePPR;
+ 
++typedef union IRTE {
++    struct {
++#ifdef HOST_WORDS_BIGENDIAN
++        uint32_t destination:8;
++        uint32_t rsvd_1:1;
++        uint32_t dm:1;
++        uint32_t rq_eoi:1;
++        uint32_t int_type:3;
++        uint32_t no_fault:1;
++        uint32_t valid:1;
++#else
++        uint32_t valid:1;
++        uint32_t no_fault:1;
++        uint32_t int_type:3;
++        uint32_t rq_eoi:1;
++        uint32_t dm:1;
++        uint32_t rsvd_1:1;
++        uint32_t destination:8;
++#endif
++        uint32_t vector:8;
++        uint32_t rsvd_2:8;
++    } bits;
++    uint32_t data;
++} IRTE;
++
+ /* configure MMIO registers at startup/reset */
+ static void amdvi_set_quad(AMDVIState *s, hwaddr addr, uint64_t val,
+                            uint64_t romask, uint64_t w1cmask)
+@@ -660,6 +684,11 @@ static void amdvi_inval_inttable(AMDVIState *s, CMDInvalIntrTable *inval)
+         amdvi_log_illegalcom_error(s, inval->type, s->cmdbuf + s->cmdbuf_head);
+         return;
+     }
++
++    if (s->ir_cache) {
++        x86_iommu_iec_notify_all(X86_IOMMU_DEVICE(s), true, 0, 0);
++    }
++
+     trace_amdvi_intr_inval();
+ }
+ 
+@@ -1221,6 +1250,197 @@ static IOMMUTLBEntry amdvi_translate(MemoryRegion *iommu, hwaddr addr,
+     return ret;
+ }
+ 
++static inline int amdvi_ir_handle_non_vectored(MSIMessage *src,
++                                               MSIMessage *dst, uint8_t bitpos,
++                                               uint64_t dte)
++{
++    if ((dte & (1UL << bitpos))) {
++        /* passing interrupt enabled */
++        memcpy(dst, src, sizeof(*dst));
++    } else {
++        /* should be target aborted */
++        return -AMDVI_TARGET_ABORT;
++    }
++    return 0;
++}
++
++static int amdvi_remap_ir_intctl(uint64_t dte, IRTE irte,
++                                 MSIMessage *src, MSIMessage *dst)
++{
++    int ret = 0;
++
++    switch ((dte >> AMDVI_DTE_INTCTL_RSHIFT) & 3UL) {
++    case AMDVI_INTCTL_PASS:
++        /* pass */
++        memcpy(dst, src, sizeof(*dst));
++        break;
++    case AMDVI_INTCTL_REMAP:
++        /* remap */
++        if (irte.bits.valid) {
++            /* LOCAL APIC address */
++            dst->address = AMDVI_LOCAL_APIC_ADDR;
++            /* destination mode */
++            dst->address |= ((uint64_t)irte.bits.dm) <<
++                            AMDVI_MSI_ADDR_DM_RSHIFT;
++            /* RH */
++            dst->address |= ((uint64_t)irte.bits.rq_eoi) <<
++                            AMDVI_MSI_ADDR_RH_RSHIFT;
++            /* Destination ID */
++            dst->address |= ((uint64_t)irte.bits.destination) <<
++                            AMDVI_MSI_ADDR_DEST_RSHIFT;
++            /* construct data - vector */
++            dst->data |= irte.bits.vector;
++            /* Interrupt type */
++            dst->data |= ((uint64_t)irte.bits.int_type) <<
++                         AMDVI_MSI_DATA_DM_RSHIFT;
++        } else  {
++            ret = -AMDVI_TARGET_ABORT;
++        }
++        break;
++    case AMDVI_INTCTL_ABORT:
++    case AMDVI_INTCTL_RSVD:
++        ret = -AMDVI_TARGET_ABORT;
++    }
++    return ret;
++}
++
++static int amdvi_irte_get(AMDVIState *s, MSIMessage *src, IRTE *irte,
++                          uint64_t *dte, uint16_t devid)
++{
++    uint64_t irte_root, offset = devid * AMDVI_DEVTAB_ENTRY_SIZE,
++             ir_table_size;
++
++    irte_root = dte[2] & AMDVI_IRTEROOT_MASK;
++    offset = (src->data & AMDVI_IRTE_INDEX_MASK) << 2;
++    ir_table_size = 1UL << (dte[2] & AMDVI_IR_TABLE_SIZE_MASK);
++    /* enforce IR table size */
++    if (offset > (ir_table_size * AMDVI_DEFAULT_IRTE_SIZE)) {
++        trace_amdvi_invalid_irte_entry(offset, ir_table_size);
++        return -AMDVI_TARGET_ABORT;
++    }
++    /* read IRTE */
++    if (dma_memory_read(&address_space_memory, irte_root + offset,
++        irte, sizeof(*irte))) {
++        trace_amdvi_irte_get_fail(irte_root, offset);
++        return -AMDVI_DEV_TAB_HW;
++    }
++    return 0;
++}
++
++static int amdvi_int_remap(X86IOMMUState *iommu, MSIMessage *src,
++                           MSIMessage *dst, uint16_t sid)
++{
++    trace_amdvi_ir_request(src->data, src->address, sid);
++
++    AMDVIState *s = AMD_IOMMU_DEVICE(iommu);
++    int ret = 0;
++    uint64_t dte[4];
++    uint32_t bitpos;
++    IRTE irte;
++
++    amdvi_get_dte(s, sid, dte);
++
++    /* interrupt remapping disabled */
++    if (!(dte[2] & AMDVI_IR_VALID)) {
++        memcpy(dst, src, sizeof(*src));
++        return ret;
++    }
++
++    ret = amdvi_irte_get(s, src, &irte, dte, sid);
++    if (ret < 0) {
++        goto no_remap;
++    }
++    switch (src->data & AMDVI_IR_TYPE_MASK) {
++    case AMDVI_MT_FIXED:
++    case AMDVI_MT_ARBIT:
++        ret = amdvi_remap_ir_intctl(dte[2], irte, src, dst);
++        if (ret < 0) {
++            goto no_remap;
++        } else {
++            s->ir_cache = true;
++            trace_amdvi_ir_remap(dst->data, dst->address, sid);
++            return ret;
++        }
++    /* not handling SMI currently */
++    case AMDVI_MT_SMI:
++        error_report("SMI interrupts not currently handled");
++        goto no_remap;
++    case AMDVI_MT_NMI:
++        bitpos = AMDVI_DTE_NMIPASS_LSHIFT;
++        break;
++    case AMDVI_MT_INIT:
++        bitpos = AMDVI_DTE_INTPASS_LSHIFT;
++        break;
++    case AMDVI_MT_EXTINT:
++        bitpos = AMDVI_DTE_EINTPASS_LSHIFT;
++        break;
++    case AMDVI_MT_LINT1:
++        bitpos = AMDVI_DTE_LINT1PASS_LSHIFT;
++        break;
++    case AMDVI_MT_LINT0:
++        bitpos = AMDVI_DTE_LINT0PASS_LSHIFT;
++    default:
++        goto no_remap;
++    }
++
++    ret = amdvi_ir_handle_non_vectored(src, dst, bitpos, dte[2]);
++    if (ret < 0){
++        goto no_remap;
++    }
++    s->ir_cache = true;
++    trace_amdvi_ir_remap(dst->data, dst->address, sid);
++    return ret;
++no_remap:
++    memcpy(dst, src, sizeof(*src));
++    trace_amdvi_ir_target_abort(dst->data, dst->address, sid);
++    return ret;
++}
++
++static MemTxResult amdvi_ir_read(void *opaque, hwaddr addr,
++                                 uint64_t *data, unsigned size,
++                                 MemTxAttrs attrs)
++{
++    return MEMTX_OK;
++}
++
++static MemTxResult amdvi_ir_write(void *opaque, hwaddr addr, uint64_t val,
++                                  unsigned size, MemTxAttrs attrs)
++{
++    AMDVIAddressSpace *as = opaque;
++    MSIMessage from = { addr + AMDVI_INT_ADDR_FIRST, val }, to = { 0, 0};
++    int ret = 0;
++
++    ret  = amdvi_int_remap(X86_IOMMU_DEVICE(as->iommu_state), &from, &to,
++                           attrs.requester_id);
++
++    if (ret < 0) {
++        trace_amdvi_ir_target_abort(from.data, from.address,
++                                    attrs.requester_id);
++        return MEMTX_ERROR;
++    }
++
++    if(dma_memory_write(&address_space_memory, to.address, &to.data, size)) {
++        trace_amdvi_ir_write_fail(to.address, to.data);
++        return MEMTX_ERROR;
++    }
++
++    return MEMTX_OK;
++}
++
++static const MemoryRegionOps amdvi_ir_ops = {
++    .read_with_attrs = amdvi_ir_read,
++    .write_with_attrs = amdvi_ir_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .impl = {
++        .min_access_size = 4,
++        .max_access_size = 4,
++    },
++    .valid = {
++        .min_access_size = 4,
++        .max_access_size = 4,
++    }
++};
++
+ static AddressSpace *amdvi_host_dma_iommu(PCIBus *bus, void *opaque, int devfn)
+ {
+     AMDVIState *s = opaque;
+@@ -1244,6 +1464,12 @@ static AddressSpace *amdvi_host_dma_iommu(PCIBus *bus, void *opaque, int devfn)
+ 
+         memory_region_init_iommu(&iommu_as[devfn]->iommu, OBJECT(s),
+                                  &s->iommu_ops, "amd-iommu", UINT64_MAX);
++        memory_region_init_io(&iommu_as[devfn]->iommu_ir, OBJECT(s),
++                              &amdvi_ir_ops, iommu_as[devfn], "amd-iommu-ir",
++                              AMDVI_INT_ADDR_SIZE);
++        memory_region_add_subregion(&iommu_as[devfn]->iommu,
++                                    AMDVI_INT_ADDR_FIRST,
++                                    &iommu_as[devfn]->iommu_ir);
+         address_space_init(&iommu_as[devfn]->as, &iommu_as[devfn]->iommu,
+                            "amd-iommu");
+     }
+@@ -1292,6 +1518,7 @@ static void amdvi_init(AMDVIState *s)
+     s->enabled = false;
+     s->ats_enabled = false;
+     s->cmdbuf_enabled = false;
++    s->ir_cache = false;
+ 
+     /* reset MMIO */
+     memset(s->mmior, 0, AMDVI_MMIO_SIZE);
+@@ -1331,11 +1558,15 @@ static void amdvi_realize(DeviceState *dev, Error **err)
+     AMDVIState *s = AMD_IOMMU_DEVICE(dev);
+     X86IOMMUState *x86_iommu = X86_IOMMU_DEVICE(dev);
+     PCIBus *bus = PC_MACHINE(qdev_get_machine())->bus;
++    PCMachineState *pcms = PC_MACHINE(qdev_get_machine());
+     s->iotlb = g_hash_table_new_full(amdvi_uint64_hash,
+                                      amdvi_uint64_equal, g_free, g_free);
+ 
+-    /* This device should take care of IOMMU PCI properties */
++    /* AMD IOMMU has Interrupt Remapping on by default */
++    x86_iommu->intr_supported = true;
+     x86_iommu->type = TYPE_AMD;
++
++    /* This device should take care of IOMMU PCI properties */
+     qdev_set_parent_bus(DEVICE(&s->pci), &bus->qbus);
+     object_property_set_bool(OBJECT(&s->pci), true, "realized", err);
+     s->capab_offset = pci_add_capability(&s->pci.dev, AMDVI_CAPAB_ID_SEC, 0,
+@@ -1347,9 +1578,13 @@ static void amdvi_realize(DeviceState *dev, Error **err)
+     memory_region_init_io(&s->mmio, OBJECT(s), &mmio_mem_ops, s, "amdvi-mmio",
+                           AMDVI_MMIO_SIZE);
+ 
++    x86_iommu->ioapic_bdf = PCI_BUILD_BDF(AMDVI_BUS_NUM,
++             AMDVI_SB_IOAPIC_ID);
++
+     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->mmio);
+     sysbus_mmio_map(SYS_BUS_DEVICE(s), 0, AMDVI_BASE_ADDR);
+     pci_setup_iommu(bus, amdvi_host_dma_iommu, s);
++    pcms->ioapic_as = amdvi_host_dma_iommu(bus, s, AMDVI_SB_IOAPIC_ID);
+     s->devid = object_property_get_int(OBJECT(&s->pci), "addr", err);
+     msi_init(&s->pci.dev, 0, 1, true, false, err);
+     amdvi_init(s);
+@@ -1376,6 +1611,7 @@ static void amdvi_class_init(ObjectClass *klass, void* data)
+     dc->vmsd = &vmstate_amdvi;
+     dc->hotpluggable = false;
+     dc_class->realize = amdvi_realize;
++    dc_class->int_remap = amdvi_int_remap;
+ }
+ 
+ static const TypeInfo amdvi = {
+diff --git a/hw/i386/amd_iommu.h b/hw/i386/amd_iommu.h
+index 6f62e3a..b8d7bd9 100644
+--- a/hw/i386/amd_iommu.h
++++ b/hw/i386/amd_iommu.h
+@@ -235,7 +235,7 @@
+ 
+ #define AMDVI_BUS_NUM                  0x0
+ /* AMD-Vi specific IOAPIC Device function */
+-#define AMDVI_DEVFN_IOAPIC             0xa0
++#define AMDVI_SB_IOAPIC_ID            0xa0
+ 
+ #define AMDVI_LOCAL_APIC_ADDR     0xfee00000
+ 
+@@ -353,6 +353,8 @@ typedef struct AMDVIState {
+     uint32_t evtlog_len;         /* event log length             */
+     uint32_t evtlog_head;        /* current IOMMU write position */
+     uint32_t evtlog_tail;        /* current Software read position */
++    /* whether we have remapped any interrupts and hence IR cache */
++    bool ir_cache;
+ 
+     /* unused for now */
+     hwaddr excl_base;            /* base DVA - IOMMU exclusion range */
+
+2ed2d97ed2e2cd3671b68c513f35ced05dd779b9 - David Kiarie, Wed Aug 10 21:24:24 2016 +0300 : hw/iommu: Prepare for AMD IOMMU interrupt remapping
+diff --git a/hw/i386/amd_iommu.h b/hw/i386/amd_iommu.h
+index 2f4ac55..6f62e3a 100644
+--- a/hw/i386/amd_iommu.h
++++ b/hw/i386/amd_iommu.h
+@@ -187,11 +187,6 @@
+ #define AMDVI_MT_LINT1  0xb
+ #define AMDVI_MT_LINT0  0xe
+ 
+-/* Ext reg, GA support */
+-#define AMDVI_GASUP    (1UL << 7)
+-/* MMIO control GA enable bits */
+-#define AMDVI_GAEN     (1UL << 17)
+-
+ /* MSI interrupt type mask */
+ #define AMDVI_IR_TYPE_MASK 0x300
+ 
+@@ -204,12 +199,18 @@
+ /* bits determining whether specific interrupts should be passed
+  * split DTE into 64-bit chunks
+  */
+-#define AMDVI_DTE_INTPASS       56
+-#define AMDVI_DTE_EINTPASS      57
+-#define AMDVI_DTE_NMIPASS       58
+-#define AMDVI_DTE_INTCTL        60
+-#define AMDVI_DTE_LINT0PASS     62
+-#define AMDVI_DTE_LINT1PASS     63
++#define AMDVI_DTE_INTPASS_LSHIFT       56
++#define AMDVI_DTE_EINTPASS_LSHIFT      57
++#define AMDVI_DTE_NMIPASS_LSHIFT       58
++#define AMDVI_DTE_INTCTL_RSHIFT        60
++#define AMDVI_DTE_LINT0PASS_LSHIFT     62
++#define AMDVI_DTE_LINT1PASS_LSHIFT     63
++
++/* INTCTL expected values */
++#define AMDVI_INTCTL_ABORT      0x0
++#define AMDVI_INTCTL_PASS       0x1
++#define AMDVI_INTCTL_REMAP      0x2
++#define AMDVI_INTCTL_RSVD       0x3
+ 
+ /* interrupt data valid */
+ #define AMDVI_IR_VALID          (1UL << 0)
+@@ -220,17 +221,6 @@
+ /* default IRTE size */
+ #define AMDVI_DEFAULT_IRTE_SIZE 0x4
+ 
+-/* IRTE size with GASup enabled */
+-#define AMDVI_IRTE_SIZE_GASUP   0x10
+-
+-#define AMDVI_IRTE_VECTOR_MASK    (0xffU << 16)
+-#define AMDVI_IRTE_DEST_MASK      (0xffU << 8)
+-#define AMDVI_IRTE_DM_MASK        (0x1U << 6)
+-#define AMDVI_IRTE_RQEOI_MASK     (0x1U << 5)
+-#define AMDVI_IRTE_INTTYPE_MASK   (0x7U << 2)
+-#define AMDVI_IRTE_SUPIOPF_MASK   (0x1U << 1)
+-#define AMDVI_IRTE_REMAP_MASK     (0x1U << 0)
+-
+ #define AMDVI_IR_TABLE_SIZE_MASK 0xfe
+ 
+ /* offsets into MSI data */
+@@ -243,6 +233,10 @@
+ #define AMDVI_MSI_ADDR_RH_RSHIFT       0x3
+ #define AMDVI_MSI_ADDR_DEST_RSHIFT     0xc
+ 
++#define AMDVI_BUS_NUM                  0x0
++/* AMD-Vi specific IOAPIC Device function */
++#define AMDVI_DEVFN_IOAPIC             0xa0
++
+ #define AMDVI_LOCAL_APIC_ADDR     0xfee00000
+ 
+ /* extended feature support */
+
+fe12df2aec757ab4f39270a0558a1079ab6227df - David Kiarie, Tue Aug 9 17:22:33 2016 +0300 : hw/i386: enforce SID verification
+diff --git a/hw/i386/intel_iommu.c b/hw/i386/intel_iommu.c
+index 496d836..e4bad6a 100644
+--- a/hw/i386/intel_iommu.c
++++ b/hw/i386/intel_iommu.c
+@@ -2043,43 +2043,41 @@ static int vtd_irte_get(IntelIOMMUState *iommu, uint16_t index,
+         return -VTD_FR_IR_IRTE_RSVD;
+     }
+ 
+-    if (sid != X86_IOMMU_SID_INVALID) {
+-        /* Validate IRTE SID */
+-        source_id = le32_to_cpu(entry->irte.source_id);
+-        switch (entry->irte.sid_vtype) {
+-        case VTD_SVT_NONE:
+-            VTD_DPRINTF(IR, "No SID validation for IRTE index %d", index);
+-            break;
+-
+-        case VTD_SVT_ALL:
+-            mask = vtd_svt_mask[entry->irte.sid_q];
+-            if ((source_id & mask) != (sid & mask)) {
+-                VTD_DPRINTF(GENERAL, "SID validation for IRTE index "
+-                            "%d failed (reqid 0x%04x sid 0x%04x)", index,
+-                            sid, source_id);
+-                return -VTD_FR_IR_SID_ERR;
+-            }
+-            break;
++    /* Validate IRTE SID */
++    source_id = le32_to_cpu(entry->irte.source_id);
++    switch (entry->irte.sid_vtype) {
++    case VTD_SVT_NONE:
++        VTD_DPRINTF(IR, "No SID validation for IRTE index %d", index);
++        break;
+ 
+-        case VTD_SVT_BUS:
+-            bus_max = source_id >> 8;
+-            bus_min = source_id & 0xff;
+-            bus = sid >> 8;
+-            if (bus > bus_max || bus < bus_min) {
+-                VTD_DPRINTF(GENERAL, "SID validation for IRTE index %d "
+-                            "failed (bus %d outside %d-%d)", index, bus,
+-                            bus_min, bus_max);
+-                return -VTD_FR_IR_SID_ERR;
+-            }
+-            break;
++    case VTD_SVT_ALL:
++        mask = vtd_svt_mask[entry->irte.sid_q];
++        if ((source_id & mask) != (sid & mask)) {
++            VTD_DPRINTF(GENERAL, "SID validation for IRTE index "
++                    "%d failed (reqid 0x%04x sid 0x%04x)", index,
++                    sid, source_id);
++            return -VTD_FR_IR_SID_ERR;
++        }
++        break;
+ 
+-        default:
+-            VTD_DPRINTF(GENERAL, "Invalid SVT bits (0x%x) in IRTE index "
+-                        "%d", entry->irte.sid_vtype, index);
+-            /* Take this as verification failure. */
++    case VTD_SVT_BUS:
++        bus_max = source_id >> 8;
++        bus_min = source_id & 0xff;
++        bus = sid >> 8;
++        if (bus > bus_max || bus < bus_min) {
++            VTD_DPRINTF(GENERAL, "SID validation for IRTE index %d "
++                    "failed (bus %d outside %d-%d)", index, bus,
++                    bus_min, bus_max);
+             return -VTD_FR_IR_SID_ERR;
+-            break;
+         }
++        break;
++
++    default:
++        VTD_DPRINTF(GENERAL, "Invalid SVT bits (0x%x) in IRTE index "
++                "%d", entry->irte.sid_vtype, index);
++        /* Take this as verification failure. */
++        return -VTD_FR_IR_SID_ERR;
++        break;
+     }
+ 
+     return 0;
+@@ -2252,14 +2250,17 @@ static MemTxResult vtd_mem_ir_write(void *opaque, hwaddr addr,
+ {
+     int ret = 0;
+     MSIMessage from = {}, to = {};
+-    uint16_t sid = X86_IOMMU_SID_INVALID;
++    VTDAddressSpace *as = opaque;
++    uint16_t sid = PCI_BUILD_BDF(pci_bus_num(as->bus), as->devfn);
+ 
+     from.address = (uint64_t) addr + VTD_INTERRUPT_ADDR_FIRST;
+     from.data = (uint32_t) value;
+ 
+-    if (!attrs.unspecified) {
+-        /* We have explicit Source ID */
+-        sid = attrs.requester_id;
++    if (attrs.requester_id != sid) {
++        VTD_DPRINTF(GENERAL, "int remap request for sid 0x%04x"
++                    " requester_id 0x%04x couldn't be verified",
++                    sid, attrs.requester_id);
++        return MEMTX_ERROR;
+     }
+ 
+     ret = vtd_interrupt_remap_msi(opaque, &from, &to, sid);
+@@ -2325,7 +2326,7 @@ VTDAddressSpace *vtd_find_add_as(IntelIOMMUState *s, PCIBus *bus, int devfn)
+         memory_region_init_iommu(&vtd_dev_as->iommu, OBJECT(s),
+                                  &s->iommu_ops, "intel_iommu", UINT64_MAX);
+         memory_region_init_io(&vtd_dev_as->iommu_ir, OBJECT(s),
+-                              &vtd_mem_ir_ops, s, "intel_iommu_ir",
++                              &vtd_mem_ir_ops, vtd_dev_as, "intel_iommu_ir",
+                               VTD_INTERRUPT_ADDR_SIZE);
+         memory_region_add_subregion(&vtd_dev_as->iommu, VTD_INTERRUPT_ADDR_FIRST,
+                                     &vtd_dev_as->iommu_ir);
+
+f95473d929e337e9a559ff2f73e0434c5306c0eb - David Kiarie, Tue Aug 9 17:19:09 2016 +0300 : hw/msi: Allow platform devices to use explicit SID
+diff --git a/hw/i386/intel_iommu.c b/hw/i386/intel_iommu.c
+index d6e02c8..496d836 100644
+--- a/hw/i386/intel_iommu.c
++++ b/hw/i386/intel_iommu.c
+@@ -2466,6 +2466,9 @@ static void vtd_realize(DeviceState *dev, Error **errp)
+     vtd_init(s);
+     sysbus_mmio_map(SYS_BUS_DEVICE(s), 0, Q35_HOST_BRIDGE_IOMMU_ADDR);
+     pci_setup_iommu(bus, vtd_host_dma_iommu, dev);
++    /* IOMMU expected IOAPIC SID */
++    x86_iommu->ioapic_bdf = PCI_BUILD_BDF(Q35_PSEUDO_DEVFN_IOAPIC,
++                            Q35_PSEUDO_DEVFN_IOAPIC);
+     /* Pseudo address space under root PCI bus. */
+     pcms->ioapic_as = vtd_host_dma_iommu(bus, s, Q35_PSEUDO_DEVFN_IOAPIC);
+ 
+diff --git a/hw/i386/kvm/pci-assign.c b/hw/i386/kvm/pci-assign.c
+index 8238fbc..3f26be1 100644
+--- a/hw/i386/kvm/pci-assign.c
++++ b/hw/i386/kvm/pci-assign.c
+@@ -976,7 +976,8 @@ static void assigned_dev_update_msi(PCIDevice *pci_dev)
+     if (ctrl_byte & PCI_MSI_FLAGS_ENABLE) {
+         int virq;
+ 
+-        virq = kvm_irqchip_add_msi_route(kvm_state, 0, pci_dev);
++        virq = kvm_irqchip_add_msi_route(kvm_state, 0, pci_dev,
++                                         pci_requester_id(pci_dev));
+         if (virq < 0) {
+             perror("assigned_dev_update_msi: kvm_irqchip_add_msi_route");
+             return;
+@@ -1014,7 +1015,8 @@ static void assigned_dev_update_msi_msg(PCIDevice *pci_dev)
+     }
+ 
+     kvm_irqchip_update_msi_route(kvm_state, assigned_dev->msi_virq[0],
+-                                 msi_get_message(pci_dev, 0), pci_dev);
++                                 msi_get_message(pci_dev, 0), pci_dev,
++                                 pci_requester_id(pci_dev));
+     kvm_irqchip_commit_routes(kvm_state);
+ }
+ 
+@@ -1078,7 +1080,8 @@ static int assigned_dev_update_msix_mmio(PCIDevice *pci_dev)
+             continue;
+         }
+ 
+-        r = kvm_irqchip_add_msi_route(kvm_state, i, pci_dev);
++        r = kvm_irqchip_add_msi_route(kvm_state, i, pci_dev,
++                                      pci_requester_id(pci_dev));
+         if (r < 0) {
+             return r;
+         }
+@@ -1599,7 +1602,8 @@ static void assigned_dev_msix_mmio_write(void *opaque, hwaddr addr,
+ 
+                 ret = kvm_irqchip_update_msi_route(kvm_state,
+                                                    adev->msi_virq[i], msg,
+-                                                   pdev);
++                                                   pdev,
++                                                   pci_requester_id(pdev));
+                 if (ret) {
+                     error_report("Error updating irq routing entry (%d)", ret);
+                 }
+diff --git a/hw/intc/ioapic.c b/hw/intc/ioapic.c
+index 31791b0..b8b2f33 100644
+--- a/hw/intc/ioapic.c
++++ b/hw/intc/ioapic.c
+@@ -95,9 +95,17 @@ static void ioapic_entry_parse(uint64_t entry, struct ioapic_entry_info *info)
+         (info->delivery_mode << MSI_DATA_DELIVERY_MODE_SHIFT);
+ }
+ 
+-static void ioapic_service(IOAPICCommonState *s)
++static void ioapic_as_write(IOAPICCommonState *s, uint32_t data, uint64_t addr)
+ {
+     AddressSpace *ioapic_as = PC_MACHINE(qdev_get_machine())->ioapic_as;
++    MemTxAttrs attrs;
++
++    attrs.requester_id = s->devid;
++    address_space_stl_le(ioapic_as, addr, data, attrs, NULL);
++}
++
++static void ioapic_service(IOAPICCommonState *s)
++{
+     struct ioapic_entry_info info;
+     uint8_t i;
+     uint32_t mask;
+@@ -141,7 +149,7 @@ static void ioapic_service(IOAPICCommonState *s)
+                  * the IOAPIC message into a MSI one, and its
+                  * address space will decide whether we need a
+                  * translation. */
+-                stl_le_phys(ioapic_as, info.addr, info.data);
++                ioapic_as_write(s, info.data, info.addr);
+             }
+         }
+     }
+@@ -197,7 +205,7 @@ static void ioapic_update_kvm_routes(IOAPICCommonState *s)
+             ioapic_entry_parse(s->ioredtbl[i], &info);
+             msg.address = info.addr;
+             msg.data = info.data;
+-            kvm_irqchip_update_msi_route(kvm_state, i, msg, NULL);
++            kvm_irqchip_update_msi_route(kvm_state, i, msg, NULL, s->devid);
+         }
+         kvm_irqchip_commit_routes(kvm_state);
+     }
+@@ -385,12 +393,22 @@ static void ioapic_machine_done_notify(Notifier *notifier, void *data)
+ 
+     if (kvm_irqchip_is_split()) {
+         X86IOMMUState *iommu = x86_iommu_get_default();
++        MSIMessage msg = {0, 0};
++        int i;
++
+         if (iommu) {
+             /* Register this IOAPIC with IOMMU IEC notifier, so that
+              * when there are IR invalidates, we can be notified to
+              * update kernel IR cache. */
+             x86_iommu_iec_register_notifier(iommu, ioapic_iec_notifier, s);
++            s->devid = iommu->ioapic_bdf;
++            /* update IOAPIC routes to the right SID */
++            for (i = 0; i < IOAPIC_NUM_PINS; i++) {
++                kvm_irqchip_update_msi_route(kvm_state, i, msg, NULL, s->devid);
++            }
++            kvm_irqchip_commit_routes(kvm_state);
+         }
++
+     }
+ #endif
+ }
+@@ -407,7 +425,6 @@ static void ioapic_realize(DeviceState *dev, Error **errp)
+ 
+     memory_region_init_io(&s->io_memory, OBJECT(s), &ioapic_io_ops, s,
+                           "ioapic", 0x1000);
+-
+     qdev_init_gpio_in(dev, ioapic_set_irq, IOAPIC_NUM_PINS);
+ 
+     ioapics[ioapic_no] = s;
+diff --git a/hw/misc/ivshmem.c b/hw/misc/ivshmem.c
+index 40a2ebc..9d5133f 100644
+--- a/hw/misc/ivshmem.c
++++ b/hw/misc/ivshmem.c
+@@ -318,7 +318,8 @@ static int ivshmem_vector_unmask(PCIDevice *dev, unsigned vector,
+ 
+     IVSHMEM_DPRINTF("vector unmask %p %d\n", dev, vector);
+ 
+-    ret = kvm_irqchip_update_msi_route(kvm_state, v->virq, msg, dev);
++    ret = kvm_irqchip_update_msi_route(kvm_state, v->virq, msg, dev,
++                                       pci_requester_id(dev));
+     if (ret < 0) {
+         return ret;
+     }
+@@ -447,7 +448,8 @@ static void ivshmem_add_kvm_msi_virq(IVShmemState *s, int vector,
+     IVSHMEM_DPRINTF("ivshmem_add_kvm_msi_virq vector:%d\n", vector);
+     assert(!s->msi_vectors[vector].pdev);
+ 
+-    ret = kvm_irqchip_add_msi_route(kvm_state, vector, pdev);
++    ret = kvm_irqchip_add_msi_route(kvm_state, vector, pdev,
++                                    pci_requester_id(pdev));
+     if (ret < 0) {
+         error_setg(errp, "kvm_irqchip_add_msi_route failed");
+         return;
+diff --git a/hw/vfio/pci.c b/hw/vfio/pci.c
+index 7bfa17c..a745e07 100644
+--- a/hw/vfio/pci.c
++++ b/hw/vfio/pci.c
+@@ -429,7 +429,8 @@ static void vfio_add_kvm_msi_virq(VFIOPCIDevice *vdev, VFIOMSIVector *vector,
+         return;
+     }
+ 
+-    virq = kvm_irqchip_add_msi_route(kvm_state, vector_n, &vdev->pdev);
++    virq = kvm_irqchip_add_msi_route(kvm_state, vector_n, &vdev->pdev,
++                                     pci_requester_id(&vdev->pdev));
+     if (virq < 0) {
+         event_notifier_cleanup(&vector->kvm_interrupt);
+         return;
+@@ -457,7 +458,8 @@ static void vfio_remove_kvm_msi_virq(VFIOMSIVector *vector)
+ static void vfio_update_kvm_msi_virq(VFIOMSIVector *vector, MSIMessage msg,
+                                      PCIDevice *pdev)
+ {
+-    kvm_irqchip_update_msi_route(kvm_state, vector->virq, msg, pdev);
++    kvm_irqchip_update_msi_route(kvm_state, vector->virq, msg, pdev,
++                                 pci_requester_id(pdev));
+     kvm_irqchip_commit_routes(kvm_state);
+ }
+ 
+diff --git a/hw/virtio/virtio-pci.c b/hw/virtio/virtio-pci.c
+index 755f921..658d904 100644
+--- a/hw/virtio/virtio-pci.c
++++ b/hw/virtio/virtio-pci.c
+@@ -705,7 +705,8 @@ static int kvm_virtio_pci_vq_vector_use(VirtIOPCIProxy *proxy,
+     int ret;
+ 
+     if (irqfd->users == 0) {
+-        ret = kvm_irqchip_add_msi_route(kvm_state, vector, &proxy->pci_dev);
++        ret = kvm_irqchip_add_msi_route(kvm_state, vector, &proxy->pci_dev,
++                                        pci_requester_id(&proxy->pci_dev));
+         if (ret < 0) {
+             return ret;
+         }
+@@ -833,12 +834,14 @@ static int virtio_pci_vq_vector_unmask(VirtIOPCIProxy *proxy,
+     EventNotifier *n = virtio_queue_get_guest_notifier(vq);
+     VirtIOIRQFD *irqfd;
+     int ret = 0;
++    uint16_t requester_id = pci_requester_id(&proxy->pci_dev);
+ 
+     if (proxy->vector_irqfd) {
+         irqfd = &proxy->vector_irqfd[vector];
+         if (irqfd->msg.data != msg.data || irqfd->msg.address != msg.address) {
+             ret = kvm_irqchip_update_msi_route(kvm_state, irqfd->virq, msg,
+-                                               &proxy->pci_dev);
++                                               &proxy->pci_dev,
++                                               requester_id);
+             if (ret < 0) {
+                 return ret;
+             }
+diff --git a/include/hw/i386/ioapic_internal.h b/include/hw/i386/ioapic_internal.h
+index a11d86d..d68a24f 100644
+--- a/include/hw/i386/ioapic_internal.h
++++ b/include/hw/i386/ioapic_internal.h
+@@ -103,6 +103,7 @@ typedef struct IOAPICCommonClass {
+ struct IOAPICCommonState {
+     SysBusDevice busdev;
+     MemoryRegion io_memory;
++    uint16_t devid;
+     uint8_t id;
+     uint8_t ioregsel;
+     uint32_t irr;
+diff --git a/include/hw/i386/x86-iommu.h b/include/hw/i386/x86-iommu.h
+index 0c89d98..5d05865 100644
+--- a/include/hw/i386/x86-iommu.h
++++ b/include/hw/i386/x86-iommu.h
+@@ -72,6 +72,7 @@ typedef struct IEC_Notifier IEC_Notifier;
+ 
+ struct X86IOMMUState {
+     SysBusDevice busdev;
++    uint16_t ioapic_bdf;        /* expected IOAPIC SID        */
+     bool intr_supported;        /* Whether vIOMMU supports IR */
+     IommuType type;             /* IOMMU type - AMD/Intel     */
+     QLIST_HEAD(, IEC_Notifier) iec_notifiers; /* IEC notify list */
+diff --git a/include/sysemu/kvm.h b/include/sysemu/kvm.h
+index c9c2436..ae81f92 100644
+--- a/include/sysemu/kvm.h
++++ b/include/sysemu/kvm.h
+@@ -357,7 +357,8 @@ int kvm_arch_on_sigbus(int code, void *addr);
+ void kvm_arch_init_irq_routing(KVMState *s);
+ 
+ int kvm_arch_fixup_msi_route(struct kvm_irq_routing_entry *route,
+-                             uint64_t address, uint32_t data, PCIDevice *dev);
++                             uint64_t address, uint32_t data,
++                             uint16_t requester_id);
+ 
+ /* Notify arch about newly added MSI routes */
+ int kvm_arch_add_msi_route_post(struct kvm_irq_routing_entry *route,
+@@ -481,18 +482,20 @@ static inline void cpu_synchronize_post_init(CPUState *cpu)
+ 
+ /**
+  * kvm_irqchip_add_msi_route - Add MSI route for specific vector
+- * @s:      KVM state
+- * @vector: which vector to add. This can be either MSI/MSIX
+- *          vector. The function will automatically detect whether
+- *          MSI/MSIX is enabled, and fetch corresponding MSI
+- *          message.
+- * @dev:    Owner PCI device to add the route. If @dev is specified
+- *          as @NULL, an empty MSI message will be inited.
+- * @return: virq (>=0) when success, errno (<0) when failed.
++ * @s:            KVM state
++ * @vector:       which vector to add. This can be either MSI/MSIX
++ *                vector. The function will automatically detect whether
++ *                MSI/MSIX is enabled, and fetch corresponding MSI
++ *                message.
++ * @dev:          Owner PCI device to add the route. If @dev is specified
++ *                as @NULL, an empty MSI message will be inited.
++ * @requester_id: SID when calling IOMMU code
++ * @return:       virq (>=0) when success, errno (<0) when failed.
+  */
+-int kvm_irqchip_add_msi_route(KVMState *s, int vector, PCIDevice *dev);
++int kvm_irqchip_add_msi_route(KVMState *s, int vector, PCIDevice *dev,
++                              uint16_t requester_id);
+ int kvm_irqchip_update_msi_route(KVMState *s, int virq, MSIMessage msg,
+-                                 PCIDevice *dev);
++                                 PCIDevice *dev, uint16_t requester_id);
+ void kvm_irqchip_commit_routes(KVMState *s);
+ void kvm_irqchip_release_virq(KVMState *s, int virq);
+ 
+diff --git a/kvm-all.c b/kvm-all.c
+index ebf35b0..e72ebc6 100644
+--- a/kvm-all.c
++++ b/kvm-all.c
+@@ -1246,7 +1246,7 @@ int kvm_irqchip_send_msi(KVMState *s, MSIMessage msg)
+     return kvm_set_irq(s, route->kroute.gsi, 1);
+ }
+ 
+-int kvm_irqchip_add_msi_route(KVMState *s, int vector, PCIDevice *dev)
++int kvm_irqchip_add_msi_route(KVMState *s, int vector, PCIDevice *dev, uint16_t requester_id)
+ {
+     struct kvm_irq_routing_entry kroute = {};
+     int virq;
+@@ -1275,7 +1275,8 @@ int kvm_irqchip_add_msi_route(KVMState *s, int vector, PCIDevice *dev)
+     kroute.u.msi.address_lo = (uint32_t)msg.address;
+     kroute.u.msi.address_hi = msg.address >> 32;
+     kroute.u.msi.data = le32_to_cpu(msg.data);
+-    if (kvm_arch_fixup_msi_route(&kroute, msg.address, msg.data, dev)) {
++    if (kvm_arch_fixup_msi_route(&kroute, msg.address, msg.data,
++                                 requester_id)) {
+         kvm_irqchip_release_virq(s, virq);
+         return -EINVAL;
+     }
+@@ -1290,7 +1291,7 @@ int kvm_irqchip_add_msi_route(KVMState *s, int vector, PCIDevice *dev)
+ }
+ 
+ int kvm_irqchip_update_msi_route(KVMState *s, int virq, MSIMessage msg,
+-                                 PCIDevice *dev)
++                                 PCIDevice *dev, uint16_t requester_id)
+ {
+     struct kvm_irq_routing_entry kroute = {};
+ 
+@@ -1308,7 +1309,8 @@ int kvm_irqchip_update_msi_route(KVMState *s, int virq, MSIMessage msg,
+     kroute.u.msi.address_lo = (uint32_t)msg.address;
+     kroute.u.msi.address_hi = msg.address >> 32;
+     kroute.u.msi.data = le32_to_cpu(msg.data);
+-    if (kvm_arch_fixup_msi_route(&kroute, msg.address, msg.data, dev)) {
++    if (kvm_arch_fixup_msi_route(&kroute, msg.address, msg.data,
++                requester_id)) {
+         return -EINVAL;
+     }
+ 
+diff --git a/kvm-stub.c b/kvm-stub.c
+index 64e23f6..9a49ce0 100644
+--- a/kvm-stub.c
++++ b/kvm-stub.c
+@@ -116,7 +116,8 @@ int kvm_on_sigbus(int code, void *addr)
+ }
+ 
+ #ifndef CONFIG_USER_ONLY
+-int kvm_irqchip_add_msi_route(KVMState *s, int vector, PCIDevice *dev)
++int kvm_irqchip_add_msi_route(KVMState *s, int vector, PCIDevice *dev,
++                              uint16_t requester_id)
+ {
+     return -ENOSYS;
+ }
+@@ -130,7 +131,7 @@ void kvm_irqchip_release_virq(KVMState *s, int virq)
+ }
+ 
+ int kvm_irqchip_update_msi_route(KVMState *s, int virq, MSIMessage msg,
+-                                 PCIDevice *dev)
++                                 PCIDevice *dev, uint16_t requester_id)
+ {
+     return -ENOSYS;
+ }
+diff --git a/target-i386/kvm.c b/target-i386/kvm.c
+index 0b2016a..1d8ed16 100644
+--- a/target-i386/kvm.c
++++ b/target-i386/kvm.c
+@@ -3236,7 +3236,7 @@ void kvm_arch_init_irq_routing(KVMState *s)
+         /* If the ioapic is in QEMU and the lapics are in KVM, reserve
+            MSI routes for signaling interrupts to the local apics. */
+         for (i = 0; i < IOAPIC_NUM_PINS; i++) {
+-            if (kvm_irqchip_add_msi_route(s, 0, NULL) < 0) {
++            if (kvm_irqchip_add_msi_route(s, 0, NULL, 0) < 0) {
+                 error_report("Could not enable split IRQ mode.");
+                 exit(1);
+             }
+@@ -3404,7 +3404,8 @@ int kvm_device_msix_deassign(KVMState *s, uint32_t dev_id)
+ }
+ 
+ int kvm_arch_fixup_msi_route(struct kvm_irq_routing_entry *route,
+-                             uint64_t address, uint32_t data, PCIDevice *dev)
++                             uint64_t address, uint32_t data,
++                             uint16_t requester_id)
+ {
+     X86IOMMUState *iommu = x86_iommu_get_default();
+ 
+@@ -3418,9 +3419,8 @@ int kvm_arch_fixup_msi_route(struct kvm_irq_routing_entry *route,
+         src.address |= route->u.msi.address_lo;
+         src.data = route->u.msi.data;
+ 
+-        ret = class->int_remap(iommu, &src, &dst, dev ? \
+-                               pci_requester_id(dev) : \
+-                               X86_IOMMU_SID_INVALID);
++        ret = class->int_remap(iommu, &src, &dst, requester_id);
++
+         if (ret) {
+             trace_kvm_x86_fixup_msi_error(route->gsi);
+             return 1;
+@@ -3438,6 +3438,7 @@ typedef struct MSIRouteEntry MSIRouteEntry;
+ 
+ struct MSIRouteEntry {
+     PCIDevice *dev;             /* Device pointer */
++    uint16_t requester_id;      /* Requesting SID */
+     int vector;                 /* MSI/MSIX vector index */
+     int virq;                   /* Virtual IRQ index */
+     QLIST_ENTRY(MSIRouteEntry) list;
+@@ -3458,7 +3459,8 @@ static void kvm_update_msi_routes_all(void *private, bool global,
+         cnt++;
+         msg = pci_get_msi_message(entry->dev, entry->vector);
+         kvm_irqchip_update_msi_route(kvm_state, entry->virq,
+-                                     msg, entry->dev);
++                                     msg, entry->dev,
++                                     entry->requester_id);
+     }
+     kvm_irqchip_commit_routes(kvm_state);
+     trace_kvm_x86_update_msi_routes(cnt);
+@@ -3479,6 +3481,7 @@ int kvm_arch_add_msi_route_post(struct kvm_irq_routing_entry *route,
+ 
+     entry = g_new0(MSIRouteEntry, 1);
+     entry->dev = dev;
++    entry->requester_id = pci_requester_id(dev);
+     entry->vector = vector;
+     entry->virq = route->gsi;
+     QLIST_INSERT_HEAD(&msi_route_list, entry, list);
+
+b6a5e8b502fdce77570d8eed51e81bf15f317329 - David Kiarie, Fri Jul 8 11:18:23 2016 +0300 : hw/i386: AMD IOMMU IVRS table
+diff --git a/hw/acpi/aml-build.c b/hw/acpi/aml-build.c
+index db3e914..b2a1e40 100644
+--- a/hw/acpi/aml-build.c
++++ b/hw/acpi/aml-build.c
+@@ -226,7 +226,7 @@ static void build_extop_package(GArray *package, uint8_t op)
+     build_prepend_byte(package, 0x5B); /* ExtOpPrefix */
+ }
+ 
+-static void build_append_int_noprefix(GArray *table, uint64_t value, int size)
++void build_append_int_noprefix(GArray *table, uint64_t value, int size)
+ {
+     int i;
+ 
+diff --git a/hw/i386/acpi-build.c b/hw/i386/acpi-build.c
+index a26a4bb..49bd183 100644
+--- a/hw/i386/acpi-build.c
++++ b/hw/i386/acpi-build.c
+@@ -59,7 +59,8 @@
+ 
+ #include "qapi/qmp/qint.h"
+ #include "qom/qom-qobject.h"
+-#include "hw/i386/x86-iommu.h"
++#include "hw/i386/amd_iommu.h"
++#include "hw/i386/intel_iommu.h"
+ 
+ #include "hw/acpi/ipmi.h"
+ 
+@@ -2562,6 +2563,62 @@ build_dmar_q35(GArray *table_data, BIOSLinker *linker)
+     build_header(linker, table_data, (void *)(table_data->data + dmar_start),
+                  "DMAR", table_data->len - dmar_start, 1, NULL, NULL);
+ }
++/*
++ *   IVRS table as specified in AMD IOMMU Specification v2.62, Section 5.2
++ *   accessible here http://support.amd.com/TechDocs/48882_IOMMU.pdf
++ */
++static void
++build_amd_iommu(GArray *table_data, BIOSLinker *linker)
++{
++    int iommu_start = table_data->len;
++    AMDVIState *s = AMD_IOMMU_DEVICE(x86_iommu_get_default());
++
++    /* IVRS header */
++    acpi_data_push(table_data, sizeof(AcpiTableHeader));
++    /* IVinfo - IO virtualization information common to all
++     * IOMMU units in a system
++     */
++    build_append_int_noprefix(table_data, 40UL << 8/* PASize */, 4);
++    /* reserved */
++    build_append_int_noprefix(table_data, 0, 8);
++
++    /* IVHD definition - type 10h */
++    build_append_int_noprefix(table_data, 0x10, 1);
++    /* virtualization flags */
++    build_append_int_noprefix(table_data,
++                             (1UL << 0) | /* HtTunEn      */
++                             (1UL << 4) | /* iotblSup     */
++                             (1UL << 6) | /* PrefSup      */
++                             (1UL << 7),  /* PPRSup       */
++                             1);
++    /* IVHD length */
++    build_append_int_noprefix(table_data, 0x24, 2);
++    /* DeviceID */
++    build_append_int_noprefix(table_data, s->devid, 2);
++    /* Capability offset */
++    build_append_int_noprefix(table_data, s->capab_offset, 2);
++    /* IOMMU base address */
++    build_append_int_noprefix(table_data, s->mmio.addr, 8);
++    /* PCI Segment Group */
++    build_append_int_noprefix(table_data, 0, 2);
++    /* IOMMU info */
++    build_append_int_noprefix(table_data, 0, 2);
++    /* IOMMU Feature Reporting */
++    build_append_int_noprefix(table_data,
++                             (48UL << 30) | /* HATS   */
++                             (48UL << 28) | /* GATS   */
++                             (1UL << 2),    /* GTSup  */
++                             4);
++    /*
++     *   Type 1 device entry reporting all devices
++     *   These are 4-byte device entries currently reporting the range of
++     *   Refer to Spec - Table 95:IVHD Device Entry Type Codes(4-byte)
++     */
++    build_append_int_noprefix(table_data, 0x0000001, 4);
++
++    build_header(linker, table_data, (void *)(table_data->data + iommu_start),
++                 "IVRS", table_data->len - iommu_start, 1, NULL, NULL);
++}
+ 
+ static GArray *
+ build_rsdp(GArray *rsdp_table, BIOSLinker *linker, unsigned rsdt_tbl_offset)
+@@ -2622,11 +2679,6 @@ static bool acpi_get_mcfg(AcpiMcfgInfo *mcfg)
+     return true;
+ }
+ 
+-static bool acpi_has_iommu(void)
+-{
+-    return !!x86_iommu_get_default();
+-}
+-
+ static
+ void acpi_build(AcpiBuildTables *tables, MachineState *machine)
+ {
+@@ -2706,9 +2758,15 @@ void acpi_build(AcpiBuildTables *tables, MachineState *machine)
+         acpi_add_table(table_offsets, tables_blob);
+         build_mcfg_q35(tables_blob, tables->linker, &mcfg);
+     }
+-    if (acpi_has_iommu()) {
+-        acpi_add_table(table_offsets, tables_blob);
+-        build_dmar_q35(tables_blob, tables->linker);
++    if (x86_iommu_get_default()) {
++        IommuType IOMMUType = x86_iommu_get_type();
++        if (IOMMUType == TYPE_AMD) {
++            acpi_add_table(table_offsets, tables_blob);
++            build_amd_iommu(tables_blob, tables->linker);
++        } else if (IOMMUType == TYPE_INTEL) {
++            acpi_add_table(table_offsets, tables_blob);
++            build_dmar_q35(tables_blob, tables->linker);
++        }
+     }
+     if (pcms->acpi_nvdimm_state.is_enabled) {
+         nvdimm_build_acpi(table_offsets, tables_blob, tables->linker,
+diff --git a/hw/i386/amd_iommu.c b/hw/i386/amd_iommu.c
+index 6016778c..19da365 100644
+--- a/hw/i386/amd_iommu.c
++++ b/hw/i386/amd_iommu.c
+@@ -1329,11 +1329,13 @@ static void amdvi_reset(DeviceState *dev)
+ static void amdvi_realize(DeviceState *dev, Error **err)
+ {
+     AMDVIState *s = AMD_IOMMU_DEVICE(dev);
++    X86IOMMUState *x86_iommu = X86_IOMMU_DEVICE(dev);
+     PCIBus *bus = PC_MACHINE(qdev_get_machine())->bus;
+     s->iotlb = g_hash_table_new_full(amdvi_uint64_hash,
+                                      amdvi_uint64_equal, g_free, g_free);
+ 
+     /* This device should take care of IOMMU PCI properties */
++    x86_iommu->type = TYPE_AMD;
+     qdev_set_parent_bus(DEVICE(&s->pci), &bus->qbus);
+     object_property_set_bool(OBJECT(&s->pci), true, "realized", err);
+     s->capab_offset = pci_add_capability(&s->pci.dev, AMDVI_CAPAB_ID_SEC, 0,
+diff --git a/hw/i386/intel_iommu.c b/hw/i386/intel_iommu.c
+index 28c31a2..d6e02c8 100644
+--- a/hw/i386/intel_iommu.c
++++ b/hw/i386/intel_iommu.c
+@@ -2453,6 +2453,7 @@ static void vtd_realize(DeviceState *dev, Error **errp)
+     X86IOMMUState *x86_iommu = X86_IOMMU_DEVICE(dev);
+ 
+     VTD_DPRINTF(GENERAL, "");
++    x86_iommu->type = TYPE_INTEL;
+     memset(s->vtd_as_by_bus_num, 0, sizeof(s->vtd_as_by_bus_num));
+     memory_region_init_io(&s->csrmem, OBJECT(s), &vtd_mem_ops, s,
+                           "intel_iommu", DMAR_REG_SIZE);
+diff --git a/hw/i386/x86-iommu.c b/hw/i386/x86-iommu.c
+index ce26b2a..2278af7 100644
+--- a/hw/i386/x86-iommu.c
++++ b/hw/i386/x86-iommu.c
+@@ -71,6 +71,11 @@ X86IOMMUState *x86_iommu_get_default(void)
+     return x86_iommu_default;
+ }
+ 
++IommuType x86_iommu_get_type(void)
++{
++    return x86_iommu_default->type;
++}
++
+ static void x86_iommu_realize(DeviceState *dev, Error **errp)
+ {
+     X86IOMMUState *x86_iommu = X86_IOMMU_DEVICE(dev);
+@@ -79,6 +84,7 @@ static void x86_iommu_realize(DeviceState *dev, Error **errp)
+     if (x86_class->realize) {
+         x86_class->realize(dev, errp);
+     }
++
+     x86_iommu_set_default(X86_IOMMU_DEVICE(dev));
+ }
+ 
+diff --git a/include/hw/acpi/aml-build.h b/include/hw/acpi/aml-build.h
+index e5f0878..559326c 100644
+--- a/include/hw/acpi/aml-build.h
++++ b/include/hw/acpi/aml-build.h
+@@ -367,6 +367,7 @@ Aml *aml_sizeof(Aml *arg);
+ Aml *aml_concatenate(Aml *source1, Aml *source2, Aml *target);
+ Aml *aml_object_type(Aml *object);
+ 
++void build_append_int_noprefix(GArray *table, uint64_t value, int size);
+ void
+ build_header(BIOSLinker *linker, GArray *table_data,
+              AcpiTableHeader *h, const char *sig, int len, uint8_t rev,
+diff --git a/include/hw/i386/x86-iommu.h b/include/hw/i386/x86-iommu.h
+index c48e8dd..0c89d98 100644
+--- a/include/hw/i386/x86-iommu.h
++++ b/include/hw/i386/x86-iommu.h
+@@ -37,6 +37,12 @@
+ typedef struct X86IOMMUState X86IOMMUState;
+ typedef struct X86IOMMUClass X86IOMMUClass;
+ 
++typedef enum IommuType {
++    TYPE_INTEL,
++    TYPE_AMD,
++    TYPE_NONE
++} IommuType;
++
+ struct X86IOMMUClass {
+     SysBusDeviceClass parent;
+     /* Intel/AMD specific realize() hook */
+@@ -67,6 +73,7 @@ typedef struct IEC_Notifier IEC_Notifier;
+ struct X86IOMMUState {
+     SysBusDevice busdev;
+     bool intr_supported;        /* Whether vIOMMU supports IR */
++    IommuType type;             /* IOMMU type - AMD/Intel     */
+     QLIST_HEAD(, IEC_Notifier) iec_notifiers; /* IEC notify list */
+ };
+ 
+@@ -76,6 +83,11 @@ struct X86IOMMUState {
+  */
+ X86IOMMUState *x86_iommu_get_default(void);
+ 
++/*
++ * x86_iommu_get_type - get IOMMU type
++ */
++IommuType x86_iommu_get_type(void);
++
+ /**
+  * x86_iommu_iec_register_notifier - register IEC (Interrupt Entry
+  *                                   Cache) notifiers
+
+f78f608044744f9cf0e229ed8c61bacf68bc54c5 - David Kiarie, Fri Jul 8 11:18:22 2016 +0300 : hw/i386: Introduce AMD IOMMU
+diff --git a/hw/i386/Makefile.objs b/hw/i386/Makefile.objs
+index 90e94ff..909ead6 100644
+--- a/hw/i386/Makefile.objs
++++ b/hw/i386/Makefile.objs
+@@ -3,6 +3,7 @@ obj-y += multiboot.o
+ obj-y += pc.o pc_piix.o pc_q35.o
+ obj-y += pc_sysfw.o
+ obj-y += x86-iommu.o intel_iommu.o
++obj-y += amd_iommu.o
+ obj-$(CONFIG_XEN) += ../xenpv/ xen/
+ 
+ obj-y += kvmvapic.o
+diff --git a/hw/i386/amd_iommu.c b/hw/i386/amd_iommu.c
+new file mode 100644
+index 0000000..6016778c
+--- /dev/null
++++ b/hw/i386/amd_iommu.c
+@@ -0,0 +1,1399 @@
++/*
++ * QEMU emulation of AMD IOMMU (AMD-Vi)
++ *
++ * Copyright (C) 2011 Eduard - Gabriel Munteanu
++ * Copyright (C) 2015 David Kiarie, <davidkiarie4@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, see <http://www.gnu.org/licenses/>.
++ *
++ * Cache implementation inspired by hw/i386/intel_iommu.c
++ */
++#include "qemu/osdep.h"
++#include <math.h>
++#include "hw/pci/msi.h"
++#include "hw/i386/pc.h"
++#include "hw/i386/amd_iommu.h"
++#include "hw/pci/pci_bus.h"
++#include "trace.h"
++
++/* used AMD-Vi MMIO registers */
++const char *amdvi_mmio_low[] = {
++    "AMDVI_MMIO_DEVTAB_BASE",
++    "AMDVI_MMIO_CMDBUF_BASE",
++    "AMDVI_MMIO_EVTLOG_BASE",
++    "AMDVI_MMIO_CONTROL",
++    "AMDVI_MMIO_EXCL_BASE",
++    "AMDVI_MMIO_EXCL_LIMIT",
++    "AMDVI_MMIO_EXT_FEATURES",
++    "AMDVI_MMIO_PPR_BASE",
++    "UNHANDLED"
++};
++const char *amdvi_mmio_high[] = {
++    "AMDVI_MMIO_COMMAND_HEAD",
++    "AMDVI_MMIO_COMMAND_TAIL",
++    "AMDVI_MMIO_EVTLOG_HEAD",
++    "AMDVI_MMIO_EVTLOG_TAIL",
++    "AMDVI_MMIO_STATUS",
++    "AMDVI_MMIO_PPR_HEAD",
++    "AMDVI_MMIO_PPR_TAIL",
++    "UNHANDLED"
++};
++typedef struct AMDVIAddressSpace {
++    uint8_t bus_num;            /* bus number                           */
++    uint8_t devfn;              /* device function                      */
++    AMDVIState *iommu_state;    /* AMDVI - one per machine              */
++    MemoryRegion iommu;         /* Device's address translation region  */
++    MemoryRegion iommu_ir;      /* Device's interrupt remapping region  */
++    AddressSpace as;            /* device's corresponding address space */
++} AMDVIAddressSpace;
++
++/* AMDVI cache entry */
++typedef struct AMDVIIOTLBEntry {
++    uint64_t gfn;               /* guest frame number  */
++    uint16_t domid;             /* assigned domain id  */
++    uint16_t devid;             /* device owning entry */
++    uint64_t perms;             /* access permissions  */
++    uint64_t translated_addr;   /* translated address  */
++    uint64_t page_mask;         /* physical page size  */
++} AMDVIIOTLBEntry;
++
++/* serialize IOMMU command processing */
++typedef struct QEMU_PACKED {
++#ifdef HOST_WORDS_BIGENDIAN
++    uint64_t type:4;               /* command type           */
++    uint64_t reserved:8;
++    uint64_t store_addr:49;        /* addr to write          */
++    uint64_t completion_flush:1;   /* allow more executions  */
++    uint64_t completion_int:1;     /* set MMIOWAITINT        */
++    uint64_t completion_store:1;   /* write data to address  */
++#else
++    uint64_t completion_store:1;
++    uint64_t completion_int:1;
++    uint64_t completion_flush:1;
++    uint64_t store_addr:49;
++    uint64_t reserved:8;
++    uint64_t type:4;
++#endif /* __BIG_ENDIAN_BITFIELD */
++    uint64_t store_data;           /* data to write          */
++} CMDCompletionWait;
++
++/* invalidate internal caches for devid */
++typedef struct QEMU_PACKED {
++#ifdef HOST_WORDS_BIGENDIAN
++    uint64_t devid:16;             /* device to invalidate   */
++    uint64_t reserved_1:44;
++    uint64_t type:4;               /* command type           */
++#else
++    uint64_t devid:16;
++    uint64_t reserved_1:44;
++    uint64_t type:4;
++#endif /* __BIG_ENDIAN_BITFIELD */
++    uint64_t reserved_2;
++} CMDInvalDevEntry;
++
++/* invalidate a range of entries in IOMMU translation cache for devid */
++typedef struct QEMU_PACKED {
++#ifdef HOST_WORDS_BIGENDIAN
++    uint64_t type:4;               /* command type           */
++    uint64_t reserved_2:12
++    uint64_t domid:16;             /* domain to inval for    */
++    uint64_t reserved_1:12;
++    uint64_t pasid:20;
++#else
++    uint64_t pasid:20;
++    uint64_t reserved_1:12;
++    uint64_t domid:16;
++    uint64_t reserved_2:12;
++    uint64_t type:4;
++#endif /* __BIG_ENDIAN_BITFIELD */
++
++#ifdef HOST_WORDS_BIGENDIAN
++    uint64_t address:51;          /* address to invalidate   */
++    uint64_t reserved_3:10;
++    uint64_t guest:1;             /* G/N invalidation        */
++    uint64_t pde:1;               /* invalidate cached ptes  */
++    uint64_t size:1               /* size of invalidation    */
++#else
++    uint64_t size:1;
++    uint64_t pde:1;
++    uint64_t guest:1;
++    uint64_t reserved_3:10;
++    uint64_t address:51;
++#endif /* __BIG_ENDIAN_BITFIELD */
++} CMDInvalIommuPages;
++
++/* inval specified address for devid from remote IOTLB */
++typedef struct QEMU_PACKED {
++#ifdef HOST_WORDS_BIGENDIAN
++    uint64_t type:4;            /* command type        */
++    uint64_t pasid_19_6:4;
++    uint64_t pasid_7_0:8;
++    uint64_t queuid:16;
++    uint64_t maxpend:8;
++    uint64_t pasid_15_8;
++    uint64_t devid:16;         /* related devid        */
++#else
++    uint64_t devid:16;
++    uint64_t pasid_15_8:8;
++    uint64_t maxpend:8;
++    uint64_t queuid:16;
++    uint64_t pasid_7_0:8;
++    uint64_t pasid_19_6:4;
++    uint64_t type:4;
++#endif /* __BIG_ENDIAN_BITFIELD */
++
++#ifdef HOST_WORDS_BIGENDIAN
++    uint64_t address:52;       /* invalidate addr      */
++    uint64_t reserved_2:9;
++    uint64_t guest:1;          /* G/N invalidate       */
++    uint64_t reserved_1:1;
++    uint64_t size:1;           /* size of invalidation */
++#else
++    uint64_t size:1;
++    uint64_t reserved_1:1;
++    uint64_t guest:1;
++    uint64_t reserved_2:9;
++    uint64_t address:52;
++#endif /* __BIG_ENDIAN_BITFIELD */
++} CMDInvalIOTLBPages;
++
++/* invalidate all cached interrupt info for devid */
++typedef struct QEMU_PACKED {
++#ifdef HOST_WORDS_BIGENDIAN
++    uint64_t type:4;          /* command type        */
++    uint64_t reserved_1:44;
++    uint64_t devid:16;        /* related devid       */
++#else
++    uint64_t devid:16;
++    uint64_t reserved_1:44;
++    uint64_t type:4;
++#endif /* __BIG_ENDIAN_BITFIELD */
++    uint64_t reserved_2;
++} CMDInvalIntrTable;
++
++/* load adddress translation info for devid into translation cache */
++typedef struct QEMU_PACKED {
++#ifdef HOST_WORDS_BIGENDIAN
++    uint64_t type:4;          /* command type       */
++    uint64_t reserved_2:8;
++    uint64_t pasid_19_0:20;
++    uint64_t pfcount_7_0:8;
++    uint64_t reserved_1:8;
++    uint64_t devid:16;        /* related devid      */
++#else
++    uint64_t devid;
++    uint64_t reserved_1:8;
++    uint64_t pfcount_7_0:8;
++    uint64_t pasid_19_0:20;
++    uint64_t reserved_2:8;
++    uint64_t type:4;
++#endif /* __BIG_ENDIAN_BITFIELD */
++
++#ifdef HOST_WORDS_BIGENDIAN
++    uint64_t address:52;     /* invalidate address       */
++    uint64_t reserved_5:7;
++    uint64_t inval:1;        /* inval matching entries   */
++    uint64_t reserved_4:1;
++    uint64_t guest:1;        /* G/N invalidate           */
++    uint64_t reserved_3:1;
++    uint64_t size:1;         /* prefetched page size     */
++#else
++    uint64_t size:1;
++    uint64_t reserved_3:1;
++    uint64_t guest:1;
++    uint64_t reserved_4:1;
++    uint64_t inval:1;
++    uint64_t reserved_5:7;
++    uint64_t address:52;
++#endif /* __BIG_ENDIAN_BITFIELD */
++} CMDPrefetchPages;
++
++/* clear all address translation/interrupt remapping caches */
++typedef struct QEMU_PACKED {
++#ifdef HOST_WORDS_BIGENDIAN
++    uint64_t type:4;              /* command type       */
++    uint64_t reserved_1:60;
++#else
++    uint64_t reserved_1:60;
++    uint64_t type:4;
++#endif /* __BIG_ENDIAN_BITFIELD */
++    uint64_t reserved_2;
++} CMDInvalIommuAll;
++
++/* issue a PCIe completion packet for devid */
++typedef struct QEMU_PACKED {
++#ifdef HOST_WORDS_BIGENDIAN
++    uint32_t devid:16;            /* related devid      */
++    uint32_t reserved_1;
++#else
++    uint32_t reserved_1;
++    uint32_t devid:16;
++#endif /* __BIG_ENDIAN_BITFIELD */
++
++#ifdef HOST_WORDS_BIGENDIAN
++    uint32_t type:4;              /* command type       */
++    uint32_t reserved_2:8;
++    uint32_t pasid_19_0:20
++#else
++    uint32_t pasid_19_0:20;
++    uint32_t reserved_2:8;
++    uint32_t type:4;
++#endif /* __BIG_ENDIAN_BITFIELD */
++
++#ifdef HOST_WORDS_BIGENDIAN
++    uint32_t reserved_3:29;
++    uint32_t guest:1;
++    uint32_t reserved_4:2;
++#else
++    uint32_t reserved_3:2;
++    uint32_t guest:1;
++    uint32_t reserved_4:29;
++#endif /* __BIG_ENDIAN_BITFIELD */
++
++#ifdef HOST_WORDS_BIGENDIAN
++    uint32_t reserved_5:16;
++    uint32_t completion_tag:16    /* PCIe PRI informatin */
++#else
++    uint32_t completion_tag:16;
++    uint32_t reserved_5:16;
++#endif /* __BIG_ENDIAN_BITFIELD */
++} CMDCompletePPR;
++
++/* configure MMIO registers at startup/reset */
++static void amdvi_set_quad(AMDVIState *s, hwaddr addr, uint64_t val,
++                           uint64_t romask, uint64_t w1cmask)
++{
++    stq_le_p(&s->mmior[addr], val);
++    stq_le_p(&s->romask[addr], romask);
++    stq_le_p(&s->w1cmask[addr], w1cmask);
++}
++
++static uint16_t amdvi_readw(AMDVIState *s, hwaddr addr)
++{
++    return lduw_le_p(&s->mmior[addr]);
++}
++
++static uint32_t amdvi_readl(AMDVIState *s, hwaddr addr)
++{
++    return ldl_le_p(&s->mmior[addr]);
++}
++
++static uint64_t amdvi_readq(AMDVIState *s, hwaddr addr)
++{
++    return ldq_le_p(&s->mmior[addr]);
++}
++
++/* internal write */
++static void amdvi_writeq_raw(AMDVIState *s, uint64_t val, hwaddr addr)
++{
++    stq_le_p(&s->mmior[addr], val);
++}
++
++/* external write */
++static void amdvi_writew(AMDVIState *s, hwaddr addr, uint16_t val)
++{
++    uint16_t romask = lduw_le_p(&s->romask[addr]);
++    uint16_t w1cmask = lduw_le_p(&s->w1cmask[addr]);
++    uint16_t oldval = lduw_le_p(&s->mmior[addr]);
++    stw_le_p(&s->mmior[addr],
++            ((oldval & romask) | (val & ~romask)) & ~(val & w1cmask));
++}
++
++static void amdvi_writel(AMDVIState *s, hwaddr addr, uint32_t val)
++{
++    uint32_t romask = ldl_le_p(&s->romask[addr]);
++    uint32_t w1cmask = ldl_le_p(&s->w1cmask[addr]);
++    uint32_t oldval = ldl_le_p(&s->mmior[addr]);
++    stl_le_p(&s->mmior[addr],
++            ((oldval & romask) | (val & ~romask)) & ~(val & w1cmask));
++}
++
++static void amdvi_writeq(AMDVIState *s, hwaddr addr, uint64_t val)
++{
++    uint64_t romask = ldq_le_p(&s->romask[addr]);
++    uint64_t w1cmask = ldq_le_p(&s->w1cmask[addr]);
++    uint32_t oldval = ldq_le_p(&s->mmior[addr]);
++    stq_le_p(&s->mmior[addr],
++            ((oldval & romask) | (val & ~romask)) & ~(val & w1cmask));
++}
++
++/* OR a 64-bit register with a 64-bit value */
++static bool amdvi_test_mask(AMDVIState *s, hwaddr addr, uint64_t val)
++{
++    return amdvi_readq(s, addr) | val;
++}
++
++/* OR a 64-bit register with a 64-bit value storing result in the register */
++static void amdvi_assign_orq(AMDVIState *s, hwaddr addr, uint64_t val)
++{
++    amdvi_writeq_raw(s, addr, amdvi_readq(s, addr) | val);
++}
++
++/* AND a 64-bit register with a 64-bit value storing result in the register */
++static void amdvi_assign_andq(AMDVIState *s, hwaddr addr, uint64_t val)
++{
++   amdvi_writeq_raw(s, addr, amdvi_readq(s, addr) & val);
++}
++
++static void amdvi_generate_msi_interrupt(AMDVIState *s)
++{
++    MSIMessage msg;
++    if (msi_enabled(&s->pci.dev)) {
++        msg = msi_get_message(&s->pci.dev, 0);
++        address_space_stl_le(&address_space_memory, msg.address, msg.data,
++                         MEMTXATTRS_UNSPECIFIED, NULL);
++    }
++}
++
++static void amdvi_log_event(AMDVIState *s, uint64_t *evt)
++{
++    /* event logging not enabled */
++    if (!s->evtlog_enabled || amdvi_test_mask(s, AMDVI_MMIO_STATUS,
++        AMDVI_MMIO_STATUS_EVT_OVF)) {
++        return;
++    }
++
++    /* event log buffer full */
++    if (s->evtlog_tail >= s->evtlog_len) {
++        amdvi_assign_orq(s, AMDVI_MMIO_STATUS, AMDVI_MMIO_STATUS_EVT_OVF);
++        /* generate interrupt */
++        amdvi_generate_msi_interrupt(s);
++        return;
++    }
++
++    if (dma_memory_write(&address_space_memory, s->evtlog_len + s->evtlog_tail,
++        &evt, AMDVI_EVENT_LEN)) {
++        trace_amdvi_evntlog_fail(s->evtlog, s->evtlog_tail);
++    }
++
++    s->evtlog_tail += AMDVI_EVENT_LEN;
++    amdvi_assign_orq(s, AMDVI_MMIO_STATUS, AMDVI_MMIO_STATUS_COMP_INT);
++    amdvi_generate_msi_interrupt(s);
++}
++
++static void amdvi_setevent_bits(uint64_t *buffer, uint64_t value, int start,
++                                int length)
++{
++    int index = start / 64, bitpos = start % 64;
++    uint64_t mask = ((1 << length) - 1) << bitpos;
++    buffer[index] &= ~mask;
++    buffer[index] |= (value << bitpos) & mask;
++}
++/*
++ * AMDVi event structure
++ *    0:15   -> DeviceID
++ *    55:63  -> event type + miscellaneous info
++ *    63:127 -> related address
++ */
++static void amdvi_encode_event(uint64_t *evt, uint16_t devid, uint64_t addr,
++                               uint16_t info)
++{
++    amdvi_setevent_bits(evt, devid, 0, 16);
++    amdvi_setevent_bits(evt, info, 55, 8);
++    amdvi_setevent_bits(evt, addr, 63, 64);
++}
++/* log an error encountered during a page walk
++ *
++ * @addr: virtual address in translation request
++ */
++static void amdvi_page_fault(AMDVIState *s, uint16_t devid,
++                             hwaddr addr, uint16_t info)
++{
++    uint64_t evt[4];
++
++    info |= AMDVI_EVENT_IOPF_I | AMDVI_EVENT_IOPF;
++    amdvi_encode_event(evt, devid, addr, info);
++    amdvi_log_event(s, evt);
++    pci_word_test_and_set_mask(s->pci.dev.config + PCI_STATUS,
++            PCI_STATUS_SIG_TARGET_ABORT);
++}
++/*
++ * log a master abort accessing device table
++ *  @devtab : address of device table entry
++ *  @info : error flags
++ */
++static void amdvi_log_devtab_error(AMDVIState *s, uint16_t devid,
++                                   hwaddr devtab, uint16_t info)
++{
++    uint64_t evt[4];
++
++    info |= AMDVI_EVENT_DEV_TAB_HW_ERROR;
++
++    amdvi_encode_event(evt, devid, devtab, info);
++    amdvi_log_event(s, evt);
++    pci_word_test_and_set_mask(s->pci.dev.config + PCI_STATUS,
++            PCI_STATUS_SIG_TARGET_ABORT);
++}
++
++/* log an event trying to access command buffer
++ *   @addr : address that couldn't be accessed
++ */
++static void amdvi_log_command_error(AMDVIState *s, hwaddr addr)
++{
++    uint64_t evt[4], info = AMDVI_EVENT_COMMAND_HW_ERROR;
++
++    amdvi_encode_event(evt, 0, addr, info);
++    amdvi_log_event(s, evt);
++    pci_word_test_and_set_mask(s->pci.dev.config + PCI_STATUS,
++            PCI_STATUS_SIG_TARGET_ABORT);
++}
++
++/* log an illegal comand event
++ *   @addr : address of illegal command
++ */
++static void amdvi_log_illegalcom_error(AMDVIState *s, uint16_t info,
++                                       hwaddr addr)
++{
++    uint64_t evt[4];
++
++    info |= AMDVI_EVENT_ILLEGAL_COMMAND_ERROR;
++    amdvi_encode_event(evt, 0, addr, info);
++    amdvi_log_event(s, evt);
++}
++
++/* log an error accessing device table
++ *
++ *  @devid : device owning the table entry
++ *  @devtab : address of device table entry
++ *  @info : error flags
++ */
++static void amdvi_log_illegaldevtab_error(AMDVIState *s, uint16_t devid,
++                                          hwaddr addr, uint16_t info)
++{
++    uint64_t evt[4];
++
++    info |= AMDVI_EVENT_ILLEGAL_DEVTAB_ENTRY;
++    amdvi_encode_event(evt, devid, addr, info);
++    amdvi_log_event(s, evt);
++}
++
++/* log an error accessing a PTE entry
++ * @addr : address that couldn't be accessed
++ */
++static void amdvi_log_pagetab_error(AMDVIState *s, uint16_t devid,
++                                    hwaddr addr, uint16_t info)
++{
++    uint64_t evt[4];
++
++    info |= AMDVI_EVENT_PAGE_TAB_HW_ERROR;
++    amdvi_encode_event(evt, devid, addr, info);
++    amdvi_log_event(s, evt);
++    pci_word_test_and_set_mask(s->pci.dev.config + PCI_STATUS,
++             PCI_STATUS_SIG_TARGET_ABORT);
++}
++
++static gboolean amdvi_uint64_equal(gconstpointer v1, gconstpointer v2)
++{
++    return *((const uint64_t *)v1) == *((const uint64_t *)v2);
++}
++
++static guint amdvi_uint64_hash(gconstpointer v)
++{
++    return (guint)*(const uint64_t *)v;
++}
++
++static AMDVIIOTLBEntry *amdvi_iotlb_lookup(AMDVIState *s, hwaddr addr,
++                                           uint64_t devid)
++{
++    uint64_t key = (addr >> AMDVI_PAGE_SHIFT_4K) |
++                   ((uint64_t)(devid) << AMDVI_DEVID_SHIFT);
++    return g_hash_table_lookup(s->iotlb, &key);
++}
++
++static void amdvi_iotlb_reset(AMDVIState *s)
++{
++    assert(s->iotlb);
++    trace_amdvi_iotlb_reset();
++    g_hash_table_remove_all(s->iotlb);
++}
++
++static gboolean amdvi_iotlb_remove_by_devid(gpointer key, gpointer value,
++                                            gpointer user_data)
++{
++    AMDVIIOTLBEntry *entry = (AMDVIIOTLBEntry *)value;
++    uint16_t devid = *(uint16_t *)user_data;
++    return entry->devid == devid;
++}
++
++static void amdvi_iotlb_remove_page(AMDVIState *s, hwaddr addr,
++                                    uint64_t devid)
++{
++    uint64_t key = (addr >> AMDVI_PAGE_SHIFT_4K) |
++                   ((uint64_t)(devid) << AMDVI_DEVID_SHIFT);
++    g_hash_table_remove(s->iotlb, &key);
++}
++
++static void amdvi_update_iotlb(AMDVIState *s, uint16_t devid,
++                               uint64_t gpa, IOMMUTLBEntry to_cache,
++                               uint16_t domid)
++{
++    AMDVIIOTLBEntry *entry = g_malloc(sizeof(*entry));
++    uint64_t *key = g_malloc(sizeof(key));
++    uint64_t gfn = gpa >> AMDVI_PAGE_SHIFT_4K;
++
++    /* don't cache erroneous translations */
++    if (to_cache.perm != IOMMU_NONE) {
++        trace_amdvi_cache_update(domid, PCI_BUS_NUM(devid), PCI_SLOT(devid),
++                PCI_FUNC(devid), gpa, to_cache.translated_addr);
++
++        if (g_hash_table_size(s->iotlb) >= AMDVI_IOTLB_MAX_SIZE) {
++            amdvi_iotlb_reset(s);
++        }
++
++        entry->gfn = gfn;
++        entry->domid = domid;
++        entry->perms = to_cache.perm;
++        entry->translated_addr = to_cache.translated_addr;
++        entry->page_mask = to_cache.addr_mask;
++        *key = gfn | ((uint64_t)(devid) << AMDVI_DEVID_SHIFT);
++        g_hash_table_replace(s->iotlb, key, entry);
++    }
++}
++
++static void amdvi_completion_wait(AMDVIState *s, CMDCompletionWait *wait)
++{
++    /* pad the last 3 bits */
++    hwaddr addr = le64_to_cpu(wait->store_addr) << 3;
++    uint64_t data = le64_to_cpu(wait->store_data);
++
++    if (wait->reserved) {
++        amdvi_log_illegalcom_error(s, wait->type, s->cmdbuf + s->cmdbuf_head);
++    }
++
++    if (wait->completion_store) {
++        if (dma_memory_write(&address_space_memory, addr, &data,
++            AMDVI_COMPLETION_DATA_SIZE)) {
++            trace_amdvi_completion_wait_fail(addr);
++        }
++    }
++
++    /* set completion interrupt */
++    if (wait->completion_int) {
++        amdvi_test_mask(s, AMDVI_MMIO_STATUS, AMDVI_MMIO_STATUS_COMP_INT);
++        /* generate interrupt */
++        amdvi_generate_msi_interrupt(s);
++    }
++
++    trace_amdvi_completion_wait(addr, data);
++}
++
++/* log error without aborting since linux seems to be using reserved bits */
++static void amdvi_inval_devtab_entry(AMDVIState *s, void *cmd)
++{
++    CMDInvalIntrTable *inval = (CMDInvalIntrTable *)cmd;
++    /* This command should invalidate internal caches of which there isn't */
++    if (inval->reserved_1 || inval->reserved_2) {
++        amdvi_log_illegalcom_error(s, inval->type, s->cmdbuf + s->cmdbuf_head);
++    }
++    trace_amdvi_devtab_inval(PCI_BUS_NUM(inval->devid), PCI_SLOT(inval->devid),
++            PCI_FUNC(inval->devid));
++}
++
++static void amdvi_complete_ppr(AMDVIState *s, void *cmd)
++{
++    CMDCompletePPR *pprcomp = (CMDCompletePPR *)cmd;
++
++    if (pprcomp->reserved_1 || pprcomp->reserved_2 || pprcomp->reserved_3 ||
++        pprcomp->reserved_4 || pprcomp->reserved_5) {
++        amdvi_log_illegalcom_error(s, pprcomp->type, s->cmdbuf +
++                s->cmdbuf_head);
++    }
++    trace_amdvi_ppr_exec();
++}
++
++static void amdvi_inval_all(AMDVIState *s, CMDInvalIommuAll *inval)
++{
++    if (inval->reserved_2 || inval->reserved_1) {
++        amdvi_log_illegalcom_error(s, inval->type, s->cmdbuf + s->cmdbuf_head);
++    }
++
++    amdvi_iotlb_reset(s);
++    trace_amdvi_all_inval();
++}
++
++static gboolean amdvi_iotlb_remove_by_domid(gpointer key, gpointer value,
++                                            gpointer user_data)
++{
++    AMDVIIOTLBEntry *entry = (AMDVIIOTLBEntry *)value;
++    uint16_t domid = *(uint16_t *)user_data;
++    return entry->domid == domid;
++}
++
++/* we don't have devid - we can't remove pages by address */
++static void amdvi_inval_pages(AMDVIState *s, CMDInvalIommuPages *inval)
++{
++    uint16_t domid = inval->domid;
++
++    if (inval->reserved_1 || inval->reserved_2 || inval->reserved_3) {
++        amdvi_log_illegalcom_error(s, inval->type, s->cmdbuf + s->cmdbuf_head);
++    }
++
++    g_hash_table_foreach_remove(s->iotlb, amdvi_iotlb_remove_by_domid,
++                                &domid);
++    trace_amdvi_pages_inval(inval->domid);
++}
++
++static void amdvi_prefetch_pages(AMDVIState *s, CMDPrefetchPages *prefetch)
++{
++    if (prefetch->reserved_1 || prefetch->reserved_2 || prefetch->reserved_3
++        || prefetch->reserved_4 || prefetch->reserved_5) {
++        amdvi_log_illegalcom_error(s, prefetch->type, s->cmdbuf +
++                s->cmdbuf_head);
++    }
++    trace_amdvi_prefetch_pages();
++}
++
++static void amdvi_inval_inttable(AMDVIState *s, CMDInvalIntrTable *inval)
++{
++    if (inval->reserved_1 || inval->reserved_2) {
++        amdvi_log_illegalcom_error(s, inval->type, s->cmdbuf + s->cmdbuf_head);
++        return;
++    }
++    trace_amdvi_intr_inval();
++}
++
++/* FIXME: Try to work with the specified size instead of all the pages
++ * when the S bit is on
++ */
++static void iommu_inval_iotlb(AMDVIState *s, CMDInvalIOTLBPages *inval)
++{
++    uint16_t devid = inval->devid;
++
++    if (inval->reserved_1 || inval->reserved_2) {
++        amdvi_log_illegalcom_error(s, inval->type, s->cmdbuf + s->cmdbuf_head);
++        return;
++    }
++
++    if (inval->size) {
++        g_hash_table_foreach_remove(s->iotlb, amdvi_iotlb_remove_by_devid,
++                                    &devid);
++    } else {
++        amdvi_iotlb_remove_page(s, inval->address << 12, inval->devid);
++    }
++    trace_amdvi_iotlb_inval();
++}
++
++/* not honouring reserved bits is regarded as an illegal command */
++static void amdvi_cmdbuf_exec(AMDVIState *s)
++{
++    CMDCompletionWait cmd;
++
++    if (dma_memory_read(&address_space_memory, s->cmdbuf + s->cmdbuf_head,
++        &cmd, AMDVI_COMMAND_SIZE)) {
++        trace_amdvi_command_read_fail(s->cmdbuf, s->cmdbuf_head);
++        amdvi_log_command_error(s, s->cmdbuf + s->cmdbuf_head);
++        return;
++    }
++
++    switch (cmd.type) {
++    case AMDVI_CMD_COMPLETION_WAIT:
++        amdvi_completion_wait(s, (CMDCompletionWait *)&cmd);
++        break;
++    case AMDVI_CMD_INVAL_DEVTAB_ENTRY:
++        amdvi_inval_devtab_entry(s, (CMDInvalDevEntry *)&cmd);
++        break;
++    case AMDVI_CMD_INVAL_AMDVI_PAGES:
++        amdvi_inval_pages(s, (CMDInvalIommuPages *)&cmd);
++        break;
++    case AMDVI_CMD_INVAL_IOTLB_PAGES:
++        iommu_inval_iotlb(s, (CMDInvalIOTLBPages *)&cmd);
++        break;
++    case AMDVI_CMD_INVAL_INTR_TABLE:
++        amdvi_inval_inttable(s, (CMDInvalIntrTable *)&cmd);
++        break;
++    case AMDVI_CMD_PREFETCH_AMDVI_PAGES:
++        amdvi_prefetch_pages(s, (CMDPrefetchPages *)&cmd);
++        break;
++    case AMDVI_CMD_COMPLETE_PPR_REQUEST:
++        amdvi_complete_ppr(s, (CMDCompletePPR *)&cmd);
++        break;
++    case AMDVI_CMD_INVAL_AMDVI_ALL:
++        amdvi_inval_all(s, (CMDInvalIommuAll *)&cmd);
++        break;
++    default:
++        trace_amdvi_unhandled_command(cmd.type);
++        /* log illegal command */
++        amdvi_log_illegalcom_error(s, cmd.type,
++                                   s->cmdbuf + s->cmdbuf_head);
++    }
++}
++
++static void amdvi_cmdbuf_run(AMDVIState *s)
++{
++    if (!s->cmdbuf_enabled) {
++        trace_amdvi_command_error(amdvi_readq(s, AMDVI_MMIO_CONTROL));
++        return;
++    }
++
++    /* check if there is work to do. */
++    while (s->cmdbuf_head != s->cmdbuf_tail) {
++        trace_amdvi_command_exec(s->cmdbuf_head, s->cmdbuf_tail, s->cmdbuf);
++        amdvi_cmdbuf_exec(s);
++        s->cmdbuf_head += AMDVI_COMMAND_SIZE;
++        amdvi_writeq_raw(s, s->cmdbuf_head, AMDVI_MMIO_COMMAND_HEAD);
++
++        /* wrap head pointer */
++        if (s->cmdbuf_head >= s->cmdbuf_len * AMDVI_COMMAND_SIZE) {
++            s->cmdbuf_head = 0;
++        }
++    }
++}
++
++static void amdvi_mmio_trace(hwaddr addr, unsigned size)
++{
++    uint8_t index = (addr & ~0x2000) / 8;
++
++    if ((addr & 0x2000)) {
++        /* high table */
++        index = index >= AMDVI_MMIO_REGS_HIGH ? AMDVI_MMIO_REGS_HIGH : index;
++        trace_amdvi_mmio_read(amdvi_mmio_high[index], addr, size, addr & ~0x07);
++    } else {
++        index = index >= AMDVI_MMIO_REGS_LOW ? AMDVI_MMIO_REGS_LOW : index;
++        trace_amdvi_mmio_read(amdvi_mmio_high[index], addr, size, addr & ~0x07);
++    }
++}
++
++static uint64_t amdvi_mmio_read(void *opaque, hwaddr addr, unsigned size)
++{
++    AMDVIState *s = opaque;
++
++    uint64_t val = -1;
++    if (addr + size > AMDVI_MMIO_SIZE) {
++        trace_amdvi_mmio_read("error: addr outside region: max ",
++                (uint64_t)AMDVI_MMIO_SIZE, addr, size);
++        return (uint64_t)-1;
++    }
++
++    if (size == 2) {
++        val = amdvi_readw(s, addr);
++    } else if (size == 4) {
++        val = amdvi_readl(s, addr);
++    } else if (size == 8) {
++        val = amdvi_readq(s, addr);
++    }
++    amdvi_mmio_trace(addr, size);
++
++    return val;
++}
++
++static void amdvi_handle_control_write(AMDVIState *s)
++{
++    unsigned long control = amdvi_readq(s, AMDVI_MMIO_CONTROL);
++    s->enabled = !!(control & AMDVI_MMIO_CONTROL_AMDVIEN);
++
++    s->ats_enabled = !!(control & AMDVI_MMIO_CONTROL_HTTUNEN);
++    s->evtlog_enabled = s->enabled && !!(control &
++                        AMDVI_MMIO_CONTROL_EVENTLOGEN);
++
++    s->evtlog_intr = !!(control & AMDVI_MMIO_CONTROL_EVENTINTEN);
++    s->completion_wait_intr = !!(control & AMDVI_MMIO_CONTROL_COMWAITINTEN);
++    s->cmdbuf_enabled = s->enabled && !!(control &
++                        AMDVI_MMIO_CONTROL_CMDBUFLEN);
++
++    /* update the flags depending on the control register */
++    if (s->cmdbuf_enabled) {
++        amdvi_assign_orq(s, AMDVI_MMIO_STATUS, AMDVI_MMIO_STATUS_CMDBUF_RUN);
++    } else {
++        amdvi_assign_andq(s, AMDVI_MMIO_STATUS, ~AMDVI_MMIO_STATUS_CMDBUF_RUN);
++    }
++    if (s->evtlog_enabled) {
++        amdvi_assign_orq(s, AMDVI_MMIO_STATUS, AMDVI_MMIO_STATUS_EVT_RUN);
++    } else {
++        amdvi_assign_andq(s, AMDVI_MMIO_STATUS, ~AMDVI_MMIO_STATUS_EVT_RUN);
++    }
++
++    trace_amdvi_control_status(control);
++    amdvi_cmdbuf_run(s);
++}
++
++static inline void amdvi_handle_devtab_write(AMDVIState *s)
++
++{
++    uint64_t val = amdvi_readq(s, AMDVI_MMIO_DEVICE_TABLE);
++    s->devtab = (val & AMDVI_MMIO_DEVTAB_BASE_MASK);
++
++    /* set device table length */
++    s->devtab_len = ((val & AMDVI_MMIO_DEVTAB_SIZE_MASK) + 1 *
++                    (AMDVI_MMIO_DEVTAB_SIZE_UNIT /
++                     AMDVI_MMIO_DEVTAB_ENTRY_SIZE));
++}
++
++static inline void amdvi_handle_cmdhead_write(AMDVIState *s)
++{
++    s->cmdbuf_head = amdvi_readq(s, AMDVI_MMIO_COMMAND_HEAD)
++                     & AMDVI_MMIO_CMDBUF_HEAD_MASK;
++    amdvi_cmdbuf_run(s);
++}
++
++static inline void amdvi_handle_cmdbase_write(AMDVIState *s)
++{
++    s->cmdbuf = amdvi_readq(s, AMDVI_MMIO_COMMAND_BASE)
++                & AMDVI_MMIO_CMDBUF_BASE_MASK;
++    s->cmdbuf_len = 1UL << (amdvi_readq(s, AMDVI_MMIO_CMDBUF_SIZE_BYTE)
++                    & AMDVI_MMIO_CMDBUF_SIZE_MASK);
++    s->cmdbuf_head = s->cmdbuf_tail = 0;
++}
++
++static inline void amdvi_handle_cmdtail_write(AMDVIState *s)
++{
++    s->cmdbuf_tail = amdvi_readq(s, AMDVI_MMIO_COMMAND_TAIL)
++                     & AMDVI_MMIO_CMDBUF_TAIL_MASK;
++    amdvi_cmdbuf_run(s);
++}
++
++static inline void amdvi_handle_excllim_write(AMDVIState *s)
++{
++    uint64_t val = amdvi_readq(s, AMDVI_MMIO_EXCL_LIMIT);
++    s->excl_limit = (val & AMDVI_MMIO_EXCL_LIMIT_MASK) |
++                    AMDVI_MMIO_EXCL_LIMIT_LOW;
++}
++
++static inline void amdvi_handle_evtbase_write(AMDVIState *s)
++{
++    uint64_t val = amdvi_readq(s, AMDVI_MMIO_EVENT_BASE);
++    s->evtlog = val & AMDVI_MMIO_EVTLOG_BASE_MASK;
++    s->evtlog_len = 1UL << (amdvi_readq(s, AMDVI_MMIO_EVTLOG_SIZE_BYTE)
++                    & AMDVI_MMIO_EVTLOG_SIZE_MASK);
++}
++
++static inline void amdvi_handle_evttail_write(AMDVIState *s)
++{
++    uint64_t val = amdvi_readq(s, AMDVI_MMIO_EVENT_TAIL);
++    s->evtlog_tail = val & AMDVI_MMIO_EVTLOG_TAIL_MASK;
++}
++
++static inline void amdvi_handle_evthead_write(AMDVIState *s)
++{
++    uint64_t val = amdvi_readq(s, AMDVI_MMIO_EVENT_HEAD);
++    s->evtlog_head = val & AMDVI_MMIO_EVTLOG_HEAD_MASK;
++}
++
++static inline void amdvi_handle_pprbase_write(AMDVIState *s)
++{
++    uint64_t val = amdvi_readq(s, AMDVI_MMIO_PPR_BASE);
++    s->ppr_log = val & AMDVI_MMIO_PPRLOG_BASE_MASK;
++    s->pprlog_len = 1UL << (amdvi_readq(s, AMDVI_MMIO_PPRLOG_SIZE_BYTE)
++                    & AMDVI_MMIO_PPRLOG_SIZE_MASK);
++}
++
++static inline void amdvi_handle_pprhead_write(AMDVIState *s)
++{
++    uint64_t val = amdvi_readq(s, AMDVI_MMIO_PPR_HEAD);
++    s->pprlog_head = val & AMDVI_MMIO_PPRLOG_HEAD_MASK;
++}
++
++static inline void amdvi_handle_pprtail_write(AMDVIState *s)
++{
++    uint64_t val = amdvi_readq(s, AMDVI_MMIO_PPR_TAIL);
++    s->pprlog_tail = val & AMDVI_MMIO_PPRLOG_TAIL_MASK;
++}
++
++/* FIXME: something might go wrong if System Software writes in chunks
++ * of one byte but linux writes in chunks of 4 bytes so currently it
++ * works correctly with linux but will definitely be busted if software
++ * reads/writes 8 bytes
++ */
++static void amdvi_mmio_reg_write(AMDVIState *s, unsigned size, uint64_t val,
++                                 hwaddr addr)
++{
++    if (size == 2) {
++        amdvi_writew(s, addr, val);
++    } else if (size == 4) {
++        amdvi_writel(s, addr, val);
++    } else if (size == 8) {
++        amdvi_writeq(s, addr, val);
++    }
++}
++
++static void amdvi_mmio_write(void *opaque, hwaddr addr, uint64_t val,
++                             unsigned size)
++{
++    AMDVIState *s = opaque;
++    unsigned long offset = addr & 0x07;
++
++    if (addr + size > AMDVI_MMIO_SIZE) {
++        trace_amdvi_mmio_write("error: addr outside region: max ",
++                (uint64_t)AMDVI_MMIO_SIZE, size, val, offset);
++        return;
++    }
++
++    amdvi_mmio_trace(addr, size);
++    switch (addr & ~0x07) {
++    case AMDVI_MMIO_CONTROL:
++        amdvi_mmio_reg_write(s, size, val, addr);
++        amdvi_handle_control_write(s);
++        break;
++    case AMDVI_MMIO_DEVICE_TABLE:
++        amdvi_mmio_reg_write(s, size, val, addr);
++       /*  set device table address
++        *   This also suffers from inability to tell whether software
++        *   is done writing
++        */
++
++        if (offset || (size == 8)) {
++            amdvi_handle_devtab_write(s);
++        }
++        break;
++    case AMDVI_MMIO_COMMAND_HEAD:
++        amdvi_mmio_reg_write(s, size, val, addr);
++        amdvi_handle_cmdhead_write(s);
++        break;
++    case AMDVI_MMIO_COMMAND_BASE:
++        amdvi_mmio_reg_write(s, size, val, addr);
++        /* FIXME - make sure System Software has finished writing incase
++         * it writes in chucks less than 8 bytes in a robust way.As for
++         * now, this hacks works for the linux driver
++         */
++        if (offset || (size == 8)) {
++            amdvi_handle_cmdbase_write(s);
++        }
++        break;
++    case AMDVI_MMIO_COMMAND_TAIL:
++        amdvi_mmio_reg_write(s, size, val, addr);
++        amdvi_handle_cmdtail_write(s);
++        break;
++    case AMDVI_MMIO_EVENT_BASE:
++        amdvi_mmio_reg_write(s, size, val, addr);
++        amdvi_handle_evtbase_write(s);
++        break;
++    case AMDVI_MMIO_EVENT_HEAD:
++        amdvi_mmio_reg_write(s, size, val, addr);
++        amdvi_handle_evthead_write(s);
++        break;
++    case AMDVI_MMIO_EVENT_TAIL:
++        amdvi_mmio_reg_write(s, size, val, addr);
++        amdvi_handle_evttail_write(s);
++        break;
++    case AMDVI_MMIO_EXCL_LIMIT:
++        amdvi_mmio_reg_write(s, size, val, addr);
++        amdvi_handle_excllim_write(s);
++        break;
++        /* PPR log base - unused for now */
++    case AMDVI_MMIO_PPR_BASE:
++        amdvi_mmio_reg_write(s, size, val, addr);
++        amdvi_handle_pprbase_write(s);
++        break;
++        /* PPR log head - also unused for now */
++    case AMDVI_MMIO_PPR_HEAD:
++        amdvi_mmio_reg_write(s, size, val, addr);
++        amdvi_handle_pprhead_write(s);
++        break;
++        /* PPR log tail - unused for now */
++    case AMDVI_MMIO_PPR_TAIL:
++        amdvi_mmio_reg_write(s, size, val, addr);
++        amdvi_handle_pprtail_write(s);
++        break;
++    }
++}
++
++static inline uint64_t amdvi_get_perms(uint64_t entry)
++{
++    return (entry & (AMDVI_DEV_PERM_READ | AMDVI_DEV_PERM_WRITE)) >>
++           AMDVI_DEV_PERM_SHIFT;
++}
++
++/* a valid entry should have V = 1 and reserved bits honoured */
++static bool amdvi_validate_dte(AMDVIState *s, uint16_t devid,
++                               uint64_t *dte)
++{
++    if ((dte[0] & AMDVI_DTE_LOWER_QUAD_RESERVED)
++        || (dte[1] & AMDVI_DTE_MIDDLE_QUAD_RESERVED)
++        || (dte[2] & AMDVI_DTE_UPPER_QUAD_RESERVED) || dte[3]) {
++        amdvi_log_illegaldevtab_error(s, devid,
++                                s->devtab + devid * AMDVI_DEVTAB_ENTRY_SIZE, 0);
++        return false;
++    }
++
++    return dte[0] & AMDVI_DEV_VALID;
++}
++
++/* get a device table entry given the devid */
++static bool amdvi_get_dte(AMDVIState *s, int devid, uint64_t *entry)
++{
++    uint32_t offset = devid * AMDVI_DEVTAB_ENTRY_SIZE;
++
++    if (dma_memory_read(&address_space_memory, s->devtab + offset, entry,
++                        AMDVI_DEVTAB_ENTRY_SIZE)) {
++        trace_amdvi_dte_get_fail(s->devtab, offset);
++        /* log error accessing dte */
++        amdvi_log_devtab_error(s, devid, s->devtab + offset, 0);
++        return false;
++    }
++
++    *entry = le64_to_cpu(*entry);
++    if (!amdvi_validate_dte(s, devid, entry)) {
++        trace_amdvi_invalid_dte(entry[0]);
++        return false;
++    }
++
++    return true;
++}
++
++/* get pte translation mode */
++static inline uint8_t get_pte_translation_mode(uint64_t pte)
++{
++    return (pte >> AMDVI_DEV_MODE_RSHIFT) & AMDVI_DEV_MODE_MASK;
++}
++
++static inline uint64_t pte_override_page_mask(uint64_t pte)
++{
++    uint8_t page_mask = 12;
++    uint64_t addr = (pte & AMDVI_DEV_PT_ROOT_MASK) ^ AMDVI_DEV_PT_ROOT_MASK;
++    /* find the first zero bit */
++    while (addr & 1) {
++        page_mask++;
++        addr = addr >> 1;
++    }
++
++    return ~((1ULL << page_mask) - 1);
++}
++
++static inline uint64_t pte_get_page_mask(uint64_t oldlevel)
++{
++    return ~((1UL << ((oldlevel * 9) + 3)) - 1);
++}
++
++static inline uint64_t amdvi_get_pte_entry(AMDVIState *s, uint64_t pte_addr,
++                                          uint16_t devid)
++{
++    uint64_t pte;
++
++    if (dma_memory_read(&address_space_memory, pte_addr, &pte, sizeof(pte))) {
++        trace_amdvi_get_pte_hwerror(pte_addr);
++        amdvi_log_pagetab_error(s, devid, pte_addr, 0);
++        pte = 0;
++        return pte;
++    }
++
++    pte = cpu_to_le64(pte);
++    return pte;
++}
++
++static void amdvi_page_walk(AMDVIAddressSpace *as, uint64_t *dte,
++                            IOMMUTLBEntry *ret, unsigned perms,
++                            hwaddr addr)
++{
++    unsigned level, present, pte_perms, oldlevel;
++    uint64_t pte = dte[0], pte_addr, page_mask;
++
++    /* make sure the DTE has TV = 1 */
++    if (pte & AMDVI_DEV_TRANSLATION_VALID) {
++        level = get_pte_translation_mode(pte);
++        if (level >= 7) {
++            trace_amdvi_mode_invalid(level, addr);
++            return;
++        }
++        if (level == 0) {
++            goto no_remap;
++        }
++
++        /* we are at the leaf page table or page table encodes a huge page */
++        while (level > 0) {
++            pte_perms = amdvi_get_perms(pte);
++            present = pte & 1;
++            if (!present || perms != (perms & pte_perms)) {
++                amdvi_page_fault(as->iommu_state, as->devfn, addr, perms);
++                trace_amdvi_page_fault(addr);
++                return;
++            }
++
++            /* go to the next lower level */
++            pte_addr = pte & AMDVI_DEV_PT_ROOT_MASK;
++            /* add offset and load pte */
++            pte_addr += ((addr >> (3 + 9 * level)) & 0x1FF) << 3;
++            pte = amdvi_get_pte_entry(as->iommu_state, pte_addr, as->devfn);
++            if (!pte) {
++                return;
++            }
++            oldlevel = level;
++            level = get_pte_translation_mode(pte);
++            if (level == 0x7) {
++                break;
++            }
++        }
++
++        if (level == 0x7) {
++            page_mask = pte_override_page_mask(pte);
++        } else {
++            page_mask = pte_get_page_mask(oldlevel);
++        }
++
++        /* get access permissions from pte */
++        ret->iova = addr & page_mask;
++        ret->translated_addr = (pte & AMDVI_DEV_PT_ROOT_MASK) & page_mask;
++        ret->addr_mask = ~page_mask;
++        ret->perm = amdvi_get_perms(pte);
++        return;
++    }
++no_remap:
++    ret->iova = addr & AMDVI_PAGE_MASK_4K;
++    ret->translated_addr = addr & AMDVI_PAGE_MASK_4K;
++    ret->addr_mask = ~AMDVI_PAGE_MASK_4K;
++    ret->perm = amdvi_get_perms(pte);
++}
++
++static void amdvi_do_translate(AMDVIAddressSpace *as, hwaddr addr,
++                               bool is_write, IOMMUTLBEntry *ret)
++{
++    AMDVIState *s = as->iommu_state;
++    uint16_t devid = PCI_BUILD_BDF(as->bus_num, as->devfn);
++    AMDVIIOTLBEntry *iotlb_entry = amdvi_iotlb_lookup(s, addr, as->devfn);
++    uint64_t entry[4];
++
++    if (iotlb_entry) {
++        trace_amdvi_iotlb_hit(PCI_BUS_NUM(devid), PCI_SLOT(devid),
++                PCI_FUNC(devid), addr, iotlb_entry->translated_addr);
++        ret->iova = addr & ~iotlb_entry->page_mask;
++        ret->translated_addr = iotlb_entry->translated_addr;
++        ret->addr_mask = iotlb_entry->page_mask;
++        ret->perm = iotlb_entry->perms;
++        return;
++    }
++
++    /* devices with V = 0 are not translated */
++    if (!amdvi_get_dte(s, devid, entry)) {
++        goto out;
++    }
++
++    amdvi_page_walk(as, entry, ret,
++                    is_write ? AMDVI_PERM_WRITE : AMDVI_PERM_READ, addr);
++
++    amdvi_update_iotlb(s, as->devfn, addr, *ret,
++                       entry[1] & AMDVI_DEV_DOMID_ID_MASK);
++    return;
++
++out:
++    ret->iova = addr & AMDVI_PAGE_MASK_4K;
++    ret->translated_addr = addr & AMDVI_PAGE_MASK_4K;
++    ret->addr_mask = ~AMDVI_PAGE_MASK_4K;
++    ret->perm = IOMMU_RW;
++}
++
++static inline bool amdvi_is_interrupt_addr(hwaddr addr)
++{
++    return addr >= AMDVI_INT_ADDR_FIRST && addr <= AMDVI_INT_ADDR_LAST;
++}
++
++static IOMMUTLBEntry amdvi_translate(MemoryRegion *iommu, hwaddr addr,
++                                     bool is_write)
++{
++    AMDVIAddressSpace *as = container_of(iommu, AMDVIAddressSpace, iommu);
++    AMDVIState *s = as->iommu_state;
++    IOMMUTLBEntry ret = {
++        .target_as = &address_space_memory,
++        .iova = addr,
++        .translated_addr = 0,
++        .addr_mask = ~(hwaddr)0,
++        .perm = IOMMU_NONE
++    };
++
++    if (!s->enabled) {
++        /* AMDVI disabled - corresponds to iommu=off not
++         * failure to provide any parameter
++         */
++        ret.iova = addr & AMDVI_PAGE_MASK_4K;
++        ret.translated_addr = addr & AMDVI_PAGE_MASK_4K;
++        ret.addr_mask = ~AMDVI_PAGE_MASK_4K;
++        ret.perm = IOMMU_RW;
++        return ret;
++    } else if (amdvi_is_interrupt_addr(addr)) {
++        ret.iova = addr & AMDVI_PAGE_MASK_4K;
++        ret.translated_addr = addr & AMDVI_PAGE_MASK_4K;
++        ret.addr_mask = ~AMDVI_PAGE_MASK_4K;
++        ret.perm = IOMMU_WO;
++        return ret;
++    }
++
++    amdvi_do_translate(as, addr, is_write, &ret);
++    trace_amdvi_translation_result(as->bus_num, PCI_SLOT(as->devfn),
++            PCI_FUNC(as->devfn), addr, ret.translated_addr);
++    return ret;
++}
++
++static AddressSpace *amdvi_host_dma_iommu(PCIBus *bus, void *opaque, int devfn)
++{
++    AMDVIState *s = opaque;
++    AMDVIAddressSpace **iommu_as;
++    int bus_num = pci_bus_num(bus);
++
++    iommu_as = s->address_spaces[bus_num];
++
++    /* allocate memory during the first run */
++    if (!iommu_as) {
++        iommu_as = g_malloc0(sizeof(AMDVIAddressSpace *) * PCI_DEVFN_MAX);
++        s->address_spaces[bus_num] = iommu_as;
++    }
++
++    /* set up AMDVI region */
++    if (!iommu_as[devfn]) {
++        iommu_as[devfn] = g_malloc0(sizeof(AMDVIAddressSpace));
++        iommu_as[devfn]->bus_num = (uint8_t)bus_num;
++        iommu_as[devfn]->devfn = (uint8_t)devfn;
++        iommu_as[devfn]->iommu_state = s;
++
++        memory_region_init_iommu(&iommu_as[devfn]->iommu, OBJECT(s),
++                                 &s->iommu_ops, "amd-iommu", UINT64_MAX);
++        address_space_init(&iommu_as[devfn]->as, &iommu_as[devfn]->iommu,
++                           "amd-iommu");
++    }
++    return &iommu_as[devfn]->as;
++}
++
++static const MemoryRegionOps mmio_mem_ops = {
++    .read = amdvi_mmio_read,
++    .write = amdvi_mmio_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .impl = {
++        .min_access_size = 1,
++        .max_access_size = 8,
++        .unaligned = false,
++    },
++    .valid = {
++        .min_access_size = 1,
++        .max_access_size = 8,
++    }
++};
++
++static void amdvi_iommu_notify_started(MemoryRegion *iommu)
++{
++    AMDVIAddressSpace *as = container_of(iommu, AMDVIAddressSpace, iommu);
++
++    hw_error("device %02x.%02x.%x requires iommu notifier which is not "
++             "currently supported", as->bus_num, PCI_SLOT(as->devfn),
++             PCI_FUNC(as->devfn));
++}
++
++static void amdvi_init(AMDVIState *s)
++{
++    amdvi_iotlb_reset(s);
++
++    s->iommu_ops.translate = amdvi_translate;
++    s->iommu_ops.notify_started = amdvi_iommu_notify_started;
++    s->devtab_len = 0;
++    s->cmdbuf_len = 0;
++    s->cmdbuf_head = 0;
++    s->cmdbuf_tail = 0;
++    s->evtlog_head = 0;
++    s->evtlog_tail = 0;
++    s->excl_enabled = false;
++    s->excl_allow = false;
++    s->mmio_enabled = false;
++    s->enabled = false;
++    s->ats_enabled = false;
++    s->cmdbuf_enabled = false;
++
++    /* reset MMIO */
++    memset(s->mmior, 0, AMDVI_MMIO_SIZE);
++    amdvi_set_quad(s, AMDVI_MMIO_EXT_FEATURES, AMDVI_EXT_FEATURES,
++            0xffffffffffffffef, 0);
++    amdvi_set_quad(s, AMDVI_MMIO_STATUS, 0, 0x98, 0x67);
++
++    /* reset device ident */
++    pci_config_set_vendor_id(s->pci.dev.config, PCI_VENDOR_ID_AMD);
++    pci_config_set_prog_interface(s->pci.dev.config, 00);
++    pci_config_set_device_id(s->pci.dev.config, s->devid);
++    pci_config_set_class(s->pci.dev.config, 0x0806);
++
++    /* reset AMDVI specific capabilities, all r/o */
++    pci_set_long(s->pci.dev.config + s->capab_offset, AMDVI_CAPAB_FEATURES);
++    pci_set_long(s->pci.dev.config + s->capab_offset + AMDVI_CAPAB_BAR_LOW,
++                 s->mmio.addr & ~(0xffff0000));
++    pci_set_long(s->pci.dev.config + s->capab_offset + AMDVI_CAPAB_BAR_HIGH,
++                (s->mmio.addr & ~(0xffff)) >> 16);
++    pci_set_long(s->pci.dev.config + s->capab_offset + AMDVI_CAPAB_RANGE,
++                 0xff000000);
++    pci_set_long(s->pci.dev.config + s->capab_offset + AMDVI_CAPAB_MISC, 0);
++    pci_set_long(s->pci.dev.config + s->capab_offset + AMDVI_CAPAB_MISC,
++            AMDVI_MAX_PH_ADDR | AMDVI_MAX_GVA_ADDR | AMDVI_MAX_VA_ADDR);
++}
++
++static void amdvi_reset(DeviceState *dev)
++{
++    AMDVIState *s = AMD_IOMMU_DEVICE(dev);
++
++    msi_reset(&s->pci.dev);
++    amdvi_init(s);
++}
++
++static void amdvi_realize(DeviceState *dev, Error **err)
++{
++    AMDVIState *s = AMD_IOMMU_DEVICE(dev);
++    PCIBus *bus = PC_MACHINE(qdev_get_machine())->bus;
++    s->iotlb = g_hash_table_new_full(amdvi_uint64_hash,
++                                     amdvi_uint64_equal, g_free, g_free);
++
++    /* This device should take care of IOMMU PCI properties */
++    qdev_set_parent_bus(DEVICE(&s->pci), &bus->qbus);
++    object_property_set_bool(OBJECT(&s->pci), true, "realized", err);
++    s->capab_offset = pci_add_capability(&s->pci.dev, AMDVI_CAPAB_ID_SEC, 0,
++                                         AMDVI_CAPAB_SIZE);
++    pci_add_capability(&s->pci.dev, PCI_CAP_ID_MSI, 0, AMDVI_CAPAB_REG_SIZE);
++    pci_add_capability(&s->pci.dev, PCI_CAP_ID_HT, 0, AMDVI_CAPAB_REG_SIZE);
++
++    /* set up MMIO */
++    memory_region_init_io(&s->mmio, OBJECT(s), &mmio_mem_ops, s, "amdvi-mmio",
++                          AMDVI_MMIO_SIZE);
++
++    sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->mmio);
++    sysbus_mmio_map(SYS_BUS_DEVICE(s), 0, AMDVI_BASE_ADDR);
++    pci_setup_iommu(bus, amdvi_host_dma_iommu, s);
++    s->devid = object_property_get_int(OBJECT(&s->pci), "addr", err);
++    msi_init(&s->pci.dev, 0, 1, true, false, err);
++    amdvi_init(s);
++}
++
++static const VMStateDescription vmstate_amdvi = {
++    .name = "amd-iommu",
++    .unmigratable = 1
++};
++
++static void amdvi_instance_init(Object *klass)
++{
++    AMDVIState *s = AMD_IOMMU_DEVICE(klass);
++
++    object_initialize(&s->pci, sizeof(s->pci), TYPE_AMD_IOMMU_PCI);
++}
++
++static void amdvi_class_init(ObjectClass *klass, void* data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    X86IOMMUClass *dc_class = X86_IOMMU_CLASS(klass);
++
++    dc->reset = amdvi_reset;
++    dc->vmsd = &vmstate_amdvi;
++    dc->hotpluggable = false;
++    dc_class->realize = amdvi_realize;
++}
++
++static const TypeInfo amdvi = {
++    .name = TYPE_AMD_IOMMU_DEVICE,
++    .parent = TYPE_X86_IOMMU_DEVICE,
++    .instance_size = sizeof(AMDVIState),
++    .instance_init = amdvi_instance_init,
++    .class_init = amdvi_class_init
++};
++
++static const TypeInfo amdviPCI = {
++    .name = "AMDVI-PCI",
++    .parent = TYPE_PCI_DEVICE,
++    .instance_size = sizeof(AMDVIPCIState),
++};
++
++static void amdviPCI_register_types(void)
++{
++    type_register_static(&amdviPCI);
++    type_register_static(&amdvi);
++}
++
++type_init(amdviPCI_register_types);
+diff --git a/hw/i386/amd_iommu.h b/hw/i386/amd_iommu.h
+new file mode 100644
+index 0000000..2f4ac55
+--- /dev/null
++++ b/hw/i386/amd_iommu.h
+@@ -0,0 +1,390 @@
++/*
++ * QEMU emulation of an AMD IOMMU (AMD-Vi)
++ *
++ * Copyright (C) 2011 Eduard - Gabriel Munteanu
++ * Copyright (C) 2015 David Kiarie, <davidkiarie4@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef AMD_IOMMU_H_
++#define AMD_IOMMU_H_
++
++#include "hw/hw.h"
++#include "hw/pci/pci.h"
++#include "hw/pci/msi.h"
++#include "hw/sysbus.h"
++#include "sysemu/dma.h"
++#include "hw/i386/pc.h"
++#include "sysemu/dma.h"
++#include "hw/i386/x86-iommu.h"
++
++/* Capability registers */
++#define AMDVI_CAPAB_BAR_LOW           0x04
++#define AMDVI_CAPAB_BAR_HIGH          0x08
++#define AMDVI_CAPAB_RANGE             0x0C
++#define AMDVI_CAPAB_MISC              0x10
++
++#define AMDVI_CAPAB_SIZE              0x18
++#define AMDVI_CAPAB_REG_SIZE          0x04
++
++/* Capability header data */
++#define AMDVI_CAPAB_ID_SEC            0xf
++#define AMDVI_CAPAB_FLAT_EXT          (1 << 28)
++#define AMDVI_CAPAB_EFR_SUP           (1 << 27)
++#define AMDVI_CAPAB_FLAG_NPCACHE      (1 << 26)
++#define AMDVI_CAPAB_FLAG_HTTUNNEL     (1 << 25)
++#define AMDVI_CAPAB_FLAG_IOTLBSUP     (1 << 24)
++#define AMDVI_CAPAB_INIT_TYPE         (3 << 16)
++
++/* No. of used MMIO registers */
++#define AMDVI_MMIO_REGS_HIGH  8
++#define AMDVI_MMIO_REGS_LOW   7
++
++/* MMIO registers */
++#define AMDVI_MMIO_DEVICE_TABLE       0x0000
++#define AMDVI_MMIO_COMMAND_BASE       0x0008
++#define AMDVI_MMIO_EVENT_BASE         0x0010
++#define AMDVI_MMIO_CONTROL            0x0018
++#define AMDVI_MMIO_EXCL_BASE          0x0020
++#define AMDVI_MMIO_EXCL_LIMIT         0x0028
++#define AMDVI_MMIO_EXT_FEATURES       0x0030
++#define AMDVI_MMIO_COMMAND_HEAD       0x2000
++#define AMDVI_MMIO_COMMAND_TAIL       0x2008
++#define AMDVI_MMIO_EVENT_HEAD         0x2010
++#define AMDVI_MMIO_EVENT_TAIL         0x2018
++#define AMDVI_MMIO_STATUS             0x2020
++#define AMDVI_MMIO_PPR_BASE           0x0038
++#define AMDVI_MMIO_PPR_HEAD           0x2030
++#define AMDVI_MMIO_PPR_TAIL           0x2038
++
++#define AMDVI_MMIO_SIZE               0x4000
++
++#define AMDVI_MMIO_DEVTAB_SIZE_MASK   ((1ULL << 12) - 1)
++#define AMDVI_MMIO_DEVTAB_BASE_MASK   (((1ULL << 52) - 1) & ~ \
++                                       AMDVI_MMIO_DEVTAB_SIZE_MASK)
++#define AMDVI_MMIO_DEVTAB_ENTRY_SIZE  32
++#define AMDVI_MMIO_DEVTAB_SIZE_UNIT   4096
++
++/* some of this are similar but just for readability */
++#define AMDVI_MMIO_CMDBUF_SIZE_BYTE       (AMDVI_MMIO_COMMAND_BASE + 7)
++#define AMDVI_MMIO_CMDBUF_SIZE_MASK       0x0F
++#define AMDVI_MMIO_CMDBUF_BASE_MASK       AMDVI_MMIO_DEVTAB_BASE_MASK
++#define AMDVI_MMIO_CMDBUF_HEAD_MASK       (((1ULL << 19) - 1) & ~0x0F)
++#define AMDVI_MMIO_CMDBUF_TAIL_MASK       AMDVI_MMIO_EVTLOG_HEAD_MASK
++
++#define AMDVI_MMIO_EVTLOG_SIZE_BYTE       (AMDVI_MMIO_EVENT_BASE + 7)
++#define AMDVI_MMIO_EVTLOG_SIZE_MASK       AMDVI_MMIO_CMDBUF_SIZE_MASK
++#define AMDVI_MMIO_EVTLOG_BASE_MASK       AMDVI_MMIO_CMDBUF_BASE_MASK
++#define AMDVI_MMIO_EVTLOG_HEAD_MASK       (((1ULL << 19) - 1) & ~0x0F)
++#define AMDVI_MMIO_EVTLOG_TAIL_MASK       AMDVI_MMIO_EVTLOG_HEAD_MASK
++
++#define AMDVI_MMIO_PPRLOG_SIZE_BYTE       (AMDVI_MMIO_EVENT_BASE + 7)
++#define AMDVI_MMIO_PPRLOG_HEAD_MASK       AMDVI_MMIO_EVTLOG_HEAD_MASK
++#define AMDVI_MMIO_PPRLOG_TAIL_MASK       AMDVI_MMIO_EVTLOG_HEAD_MASK
++#define AMDVI_MMIO_PPRLOG_BASE_MASK       AMDVI_MMIO_EVTLOG_BASE_MASK
++#define AMDVI_MMIO_PPRLOG_SIZE_MASK       AMDVI_MMIO_EVTLOG_SIZE_MASK
++
++#define AMDVI_MMIO_EXCL_ENABLED_MASK      (1ULL << 0)
++#define AMDVI_MMIO_EXCL_ALLOW_MASK        (1ULL << 1)
++#define AMDVI_MMIO_EXCL_LIMIT_MASK        AMDVI_MMIO_DEVTAB_BASE_MASK
++#define AMDVI_MMIO_EXCL_LIMIT_LOW         0xFFF
++
++/* mmio control register flags */
++#define AMDVI_MMIO_CONTROL_AMDVIEN        (1ULL << 0)
++#define AMDVI_MMIO_CONTROL_HTTUNEN        (1ULL << 1)
++#define AMDVI_MMIO_CONTROL_EVENTLOGEN     (1ULL << 2)
++#define AMDVI_MMIO_CONTROL_EVENTINTEN     (1ULL << 3)
++#define AMDVI_MMIO_CONTROL_COMWAITINTEN   (1ULL << 4)
++#define AMDVI_MMIO_CONTROL_CMDBUFLEN      (1ULL << 12)
++
++/* MMIO status register bits */
++#define AMDVI_MMIO_STATUS_CMDBUF_RUN  (1 << 4)
++#define AMDVI_MMIO_STATUS_EVT_RUN     (1 << 3)
++#define AMDVI_MMIO_STATUS_COMP_INT    (1 << 2)
++#define AMDVI_MMIO_STATUS_EVT_OVF     (1 << 0)
++
++#define AMDVI_CMDBUF_ID_BYTE              0x07
++#define AMDVI_CMDBUF_ID_RSHIFT            4
++
++#define AMDVI_CMD_COMPLETION_WAIT         0x01
++#define AMDVI_CMD_INVAL_DEVTAB_ENTRY      0x02
++#define AMDVI_CMD_INVAL_AMDVI_PAGES       0x03
++#define AMDVI_CMD_INVAL_IOTLB_PAGES       0x04
++#define AMDVI_CMD_INVAL_INTR_TABLE        0x05
++#define AMDVI_CMD_PREFETCH_AMDVI_PAGES    0x06
++#define AMDVI_CMD_COMPLETE_PPR_REQUEST    0x07
++#define AMDVI_CMD_INVAL_AMDVI_ALL         0x08
++
++#define AMDVI_DEVTAB_ENTRY_SIZE           32
++
++/* Device table entry bits 0:63 */
++#define AMDVI_DEV_VALID                   (1ULL << 0)
++#define AMDVI_DEV_TRANSLATION_VALID       (1ULL << 1)
++#define AMDVI_DEV_MODE_MASK               0x7
++#define AMDVI_DEV_MODE_RSHIFT             9
++#define AMDVI_DEV_PT_ROOT_MASK            0xFFFFFFFFFF000
++#define AMDVI_DEV_PT_ROOT_RSHIFT          12
++#define AMDVI_DEV_PERM_SHIFT              61
++#define AMDVI_DEV_PERM_READ               (1ULL << 61)
++#define AMDVI_DEV_PERM_WRITE              (1ULL << 62)
++
++/* Device table entry bits 64:127 */
++#define AMDVI_DEV_DOMID_ID_MASK          ((1ULL << 16) - 1)
++
++/* Event codes and flags, as stored in the info field */
++#define AMDVI_EVENT_ILLEGAL_DEVTAB_ENTRY  (0x1U << 12)
++#define AMDVI_EVENT_IOPF                  (0x2U << 12)
++#define   AMDVI_EVENT_IOPF_I              (1U << 3)
++#define AMDVI_EVENT_DEV_TAB_HW_ERROR      (0x3U << 12)
++#define AMDVI_EVENT_PAGE_TAB_HW_ERROR     (0x4U << 12)
++#define AMDVI_EVENT_ILLEGAL_COMMAND_ERROR (0x5U << 12)
++#define AMDVI_EVENT_COMMAND_HW_ERROR      (0x6U << 12)
++
++#define AMDVI_EVENT_LEN                  16
++#define AMDVI_PERM_READ             (1 << 0)
++#define AMDVI_PERM_WRITE            (1 << 1)
++
++#define AMDVI_FEATURE_PREFETCH            (1ULL << 0) /* page prefetch       */
++#define AMDVI_FEATURE_PPR                 (1ULL << 1) /* PPR Support         */
++#define AMDVI_FEATURE_GT                  (1ULL << 4) /* Guest Translation   */
++#define AMDVI_FEATURE_IA                  (1ULL << 6) /* inval all support   */
++#define AMDVI_FEATURE_GA                  (1ULL << 7) /* guest VAPIC support */
++#define AMDVI_FEATURE_HE                  (1ULL << 8) /* hardware error regs */
++#define AMDVI_FEATURE_PC                  (1ULL << 9) /* Perf counters       */
++
++/* reserved DTE bits */
++#define AMDVI_DTE_LOWER_QUAD_RESERVED  0x80300000000000fc
++#define AMDVI_DTE_MIDDLE_QUAD_RESERVED 0x0000000000000100
++#define AMDVI_DTE_UPPER_QUAD_RESERVED  0x08f0000000000000
++
++/* AMDVI paging mode */
++#define AMDVI_GATS_MODE                 (6ULL <<  12)
++#define AMDVI_HATS_MODE                 (6ULL <<  10)
++
++/* IOTLB */
++#define AMDVI_IOTLB_MAX_SIZE 1024
++#define AMDVI_DEVID_SHIFT    36
++
++/* interrupt types */
++#define AMDVI_MT_FIXED  0x0
++#define AMDVI_MT_ARBIT  0x1
++#define AMDVI_MT_SMI    0x2
++#define AMDVI_MT_NMI    0x3
++#define AMDVI_MT_INIT   0x4
++#define AMDVI_MT_EXTINT 0x6
++#define AMDVI_MT_LINT1  0xb
++#define AMDVI_MT_LINT0  0xe
++
++/* Ext reg, GA support */
++#define AMDVI_GASUP    (1UL << 7)
++/* MMIO control GA enable bits */
++#define AMDVI_GAEN     (1UL << 17)
++
++/* MSI interrupt type mask */
++#define AMDVI_IR_TYPE_MASK 0x300
++
++/* interrupt destination mode */
++#define AMDVI_IRDEST_MODE_MASK 0x2
++
++/* select MSI data 10:0 bits */
++#define AMDVI_IRTE_INDEX_MASK 0x7ff
++
++/* bits determining whether specific interrupts should be passed
++ * split DTE into 64-bit chunks
++ */
++#define AMDVI_DTE_INTPASS       56
++#define AMDVI_DTE_EINTPASS      57
++#define AMDVI_DTE_NMIPASS       58
++#define AMDVI_DTE_INTCTL        60
++#define AMDVI_DTE_LINT0PASS     62
++#define AMDVI_DTE_LINT1PASS     63
++
++/* interrupt data valid */
++#define AMDVI_IR_VALID          (1UL << 0)
++
++/* interrupt root table mask */
++#define AMDVI_IRTEROOT_MASK     0xffffffffffffc0
++
++/* default IRTE size */
++#define AMDVI_DEFAULT_IRTE_SIZE 0x4
++
++/* IRTE size with GASup enabled */
++#define AMDVI_IRTE_SIZE_GASUP   0x10
++
++#define AMDVI_IRTE_VECTOR_MASK    (0xffU << 16)
++#define AMDVI_IRTE_DEST_MASK      (0xffU << 8)
++#define AMDVI_IRTE_DM_MASK        (0x1U << 6)
++#define AMDVI_IRTE_RQEOI_MASK     (0x1U << 5)
++#define AMDVI_IRTE_INTTYPE_MASK   (0x7U << 2)
++#define AMDVI_IRTE_SUPIOPF_MASK   (0x1U << 1)
++#define AMDVI_IRTE_REMAP_MASK     (0x1U << 0)
++
++#define AMDVI_IR_TABLE_SIZE_MASK 0xfe
++
++/* offsets into MSI data */
++#define AMDVI_MSI_DATA_DM_RSHIFT       0x8
++#define AMDVI_MSI_DATA_LEVEL_RSHIFT    0xe
++#define AMDVI_MSI_DATA_TRM_RSHIFT      0xf
++
++/* offsets into MSI address */
++#define AMDVI_MSI_ADDR_DM_RSHIFT       0x2
++#define AMDVI_MSI_ADDR_RH_RSHIFT       0x3
++#define AMDVI_MSI_ADDR_DEST_RSHIFT     0xc
++
++#define AMDVI_LOCAL_APIC_ADDR     0xfee00000
++
++/* extended feature support */
++#define AMDVI_EXT_FEATURES (AMDVI_FEATURE_PREFETCH | AMDVI_FEATURE_PPR | \
++        AMDVI_FEATURE_IA | AMDVI_FEATURE_GT | AMDVI_FEATURE_GA | \
++        AMDVI_FEATURE_HE | AMDVI_GATS_MODE | AMDVI_HATS_MODE)
++
++/* capabilities header */
++#define AMDVI_CAPAB_FEATURES (AMDVI_CAPAB_FLAT_EXT | \
++        AMDVI_CAPAB_FLAG_NPCACHE | AMDVI_CAPAB_FLAG_IOTLBSUP \
++        | AMDVI_CAPAB_ID_SEC | AMDVI_CAPAB_INIT_TYPE | \
++        AMDVI_CAPAB_FLAG_HTTUNNEL |  AMDVI_CAPAB_EFR_SUP)
++
++/* AMDVI default address */
++#define AMDVI_BASE_ADDR 0xfed80000
++
++/* page management constants */
++#define AMDVI_PAGE_SHIFT 12
++#define AMDVI_PAGE_SIZE  (1ULL << AMDVI_PAGE_SHIFT)
++
++#define AMDVI_PAGE_SHIFT_4K 12
++#define AMDVI_PAGE_MASK_4K  (~((1ULL << AMDVI_PAGE_SHIFT_4K) - 1))
++
++#define AMDVI_MAX_VA_ADDR          (48UL << 5)
++#define AMDVI_MAX_PH_ADDR          (40UL << 8)
++#define AMDVI_MAX_GVA_ADDR         (48UL << 15)
++
++/* invalidation command device id */
++#define AMDVI_INVAL_DEV_ID_SHIFT  32
++#define AMDVI_INVAL_DEV_ID_MASK   (~((1UL << AMDVI_INVAL_DEV_ID_SHIFT) - 1))
++
++/* invalidation address */
++#define AMDVI_INVAL_ADDR_MASK_SHIFT 12
++#define AMDVI_INVAL_ADDR_MASK     (~((1UL << AMDVI_INVAL_ADDR_MASK_SHIFT) - 1))
++
++/* invalidation S bit mask */
++#define AMDVI_INVAL_ALL(val) ((val) & (0x1))
++
++/* Completion Wait data size */
++#define AMDVI_COMPLETION_DATA_SIZE    8
++
++#define AMDVI_COMMAND_SIZE   16
++
++#define AMDVI_INT_ADDR_FIRST 0xfee00000ULL
++#define AMDVI_INT_ADDR_LAST  0xfeefffffULL
++
++#define AMDVI_INT_ADDR_SIZE ((AMDVI_INT_ADDR_LAST - \
++        AMDVI_INT_ADDR_FIRST) + 1)
++
++/* Completion Wait data size */
++#define AMDVI_COMPLETION_DATA_SIZE    8
++
++#define AMDVI_COMMAND_SIZE   16
++
++/* AMD IOMMU errors */
++#define AMDVI_ILLEG_DEV_TAB  0x1
++#define AMDVI_IOPF_          0x2
++#define AMDVI_DEV_TAB_HW     0x3
++#define AMDVI_PAGE_TAB_HW    0x4
++#define AMDVI_ILLEG_COM      0x5
++#define AMDVI_COM_HW         0x6
++#define AMDVI_IOTLB_TIMEOUT  0x7
++#define AMDVI_INVAL_DEV_REQ  0x8
++#define AMDVI_INVAL_PPR_REQ  0x9
++#define AMDVI_EVT_COUNT_ZERO 0xa
++
++/* represent target and master aborts error state */
++#define AMDVI_TARGET_ABORT     0xb
++#define AMDVI_MASTER_ABORT     0xc
++
++#define TYPE_AMD_IOMMU_DEVICE "amd-iommu"
++#define AMD_IOMMU_DEVICE(obj)\
++    OBJECT_CHECK(AMDVIState, (obj), TYPE_AMD_IOMMU_DEVICE)
++
++#define TYPE_AMD_IOMMU_PCI "AMDVI-PCI"
++#define AMD_IOMMU_PCI(obj)\
++    OBJECT_CHECK(AMDVIPCIState, (obj), TYPE_AMD_IOMMU_PCI)
++
++typedef struct AMDVIAddressSpace AMDVIAddressSpace;
++
++/* functions to steal PCI config space */
++typedef struct AMDVIPCIState {
++    PCIDevice dev;               /* The PCI device itself        */
++} AMDVIPCIState;
++
++typedef struct AMDVIState {
++    X86IOMMUState iommu;        /* IOMMU bus device             */
++    AMDVIPCIState pci;          /* IOMMU PCI device             */
++
++    uint32_t version;
++    uint32_t capab_offset;       /* capability offset pointer    */
++
++    uint64_t mmio_addr;
++
++    uint32_t devid;              /* auto-assigned devid          */
++
++    bool enabled;                /* IOMMU enabled                */
++    bool ats_enabled;            /* address translation enabled  */
++    bool cmdbuf_enabled;         /* command buffer enabled       */
++    bool evtlog_enabled;         /* event log enabled            */
++    bool excl_enabled;
++
++    hwaddr devtab;               /* base address device table    */
++    size_t devtab_len;           /* device table length          */
++
++    hwaddr cmdbuf;               /* command buffer base address  */
++    uint64_t cmdbuf_len;         /* command buffer length        */
++    uint32_t cmdbuf_head;        /* current IOMMU read position  */
++    uint32_t cmdbuf_tail;        /* next Software write position */
++    bool completion_wait_intr;
++
++    hwaddr evtlog;               /* base address event log       */
++    bool evtlog_intr;
++    uint32_t evtlog_len;         /* event log length             */
++    uint32_t evtlog_head;        /* current IOMMU write position */
++    uint32_t evtlog_tail;        /* current Software read position */
++
++    /* unused for now */
++    hwaddr excl_base;            /* base DVA - IOMMU exclusion range */
++    hwaddr excl_limit;           /* limit of IOMMU exclusion range   */
++    bool excl_allow;             /* translate accesses to the exclusion range */
++    bool excl_enable;            /* exclusion range enabled          */
++
++    hwaddr ppr_log;              /* base address ppr log */
++    uint32_t pprlog_len;         /* ppr log len  */
++    uint32_t pprlog_head;        /* ppr log head */
++    uint32_t pprlog_tail;        /* ppr log tail */
++
++    MemoryRegion mmio;                 /* MMIO region                  */
++    uint8_t mmior[AMDVI_MMIO_SIZE];    /* read/write MMIO              */
++    uint8_t w1cmask[AMDVI_MMIO_SIZE];  /* read/write 1 clear mask      */
++    uint8_t romask[AMDVI_MMIO_SIZE];   /* MMIO read/only mask          */
++    bool mmio_enabled;
++
++    /* IOMMU function */
++    MemoryRegionIOMMUOps iommu_ops;
++
++    /* for each served device */
++    AMDVIAddressSpace **address_spaces[PCI_BUS_MAX];
++
++    /* IOTLB */
++    GHashTable *iotlb;
++} AMDVIState;
++
++#endif
+diff --git a/hw/i386/trace-events b/hw/i386/trace-events
+index 592de3a..5c12c10 100644
+--- a/hw/i386/trace-events
++++ b/hw/i386/trace-events
+@@ -42,3 +42,10 @@ amdvi_mode_invalid(unsigned level, uint64_t addr)"error: translation level 0x%"P
+ amdvi_page_fault(uint64_t addr) "error: page fault accessing guest physical address 0x%"PRIx64
+ amdvi_iotlb_hit(uint16_t bus, uint16_t slot, uint16_t func, uint64_t addr, uint64_t txaddr) "hit iotlb devid %02x:%02x.%x gpa 0x%"PRIx64 " hpa 0x%"PRIx64
+ amdvi_translation_result(uint16_t bus, uint16_t slot, uint16_t func, uint64_t addr, uint64_t txaddr) "devid: %02x:%02x.%x gpa 0x%"PRIx64 " hpa 0x%"PRIx64
++amdvi_irte_get_fail(uint64_t addr, uint64_t offset) "couldn't access device table entry 0x%"PRIx64" + offset 0x%"PRIx64
++amdvi_invalid_irte_entry(uint16_t devid, uint64_t offset) "devid %x requested IRTE offset 0x%"PRIx64" Outside IR table range"
++amdvi_ir_request(uint32_t data, uint64_t addr, uint16_t sid) "IR request data 0x%"PRIx32" address 0x%"PRIx64" SID %x"
++amdvi_ir_remap(uint32_t data, uint64_t addr, uint16_t sid) "IR remap data 0x%"PRIx32" address 0x%"PRIx64" SID %x"
++amdvi_ir_target_abort(uint32_t data, uint64_t addr, uint16_t sid) "IR target abort data 0x%"PRIx32" address 0x%"PRIx64" SID %x"
++amdvi_ir_write_fail(uint64_t addr, uint32_t data) "fail to write to addr 0x%"PRIx64 " value 0x%"PRIx32
++amdvi_ir_read_fail(uint64_t addr) " fail to read from addr 0x%"PRIx64
+
+1bd053e5155050369b1dcc93c7306eff9a5ea912 - David Kiarie, Fri Jul 8 11:18:21 2016 +0300 : hw/i386/trace-events: Add AMD IOMMU trace events
+diff --git a/hw/i386/trace-events b/hw/i386/trace-events
+index b4882c1..592de3a 100644
+--- a/hw/i386/trace-events
++++ b/hw/i386/trace-events
+@@ -13,3 +13,32 @@ mhp_pc_dimm_assigned_address(uint64_t addr) "0x%"PRIx64
+ 
+ # hw/i386/x86-iommu.c
+ x86_iommu_iec_notify(bool global, uint32_t index, uint32_t mask) "Notify IEC invalidation: global=%d index=%" PRIu32 " mask=%" PRIu32
++
++# hw/i386/amd_iommu.c
++amdvi_evntlog_fail(uint64_t addr, uint32_t head) "error: fail to write at addr 0x%"PRIx64 " +  offset 0x%"PRIx32
++amdvi_cache_update(uint16_t domid, uint32_t bus, uint32_t slot, uint32_t func, uint64_t gpa, uint64_t txaddr) " update iotlb domid 0x%"PRIx16" devid: %02x:%02x.%x gpa 0x%"PRIx64 " hpa 0x%"PRIx64
++amdvi_completion_wait_fail(uint64_t addr) "error: fail to write at address 0x%"PRIx64
++amdvi_mmio_write(const char *reg, uint64_t addr, unsigned size, uint64_t val, unsigned long offset) "%s write addr 0x%"PRIx64 ", size %d, val 0x%"PRIx64 ", offset 0x%"PRIx64
++amdvi_mmio_read(const char *reg, uint64_t addr, unsigned size, uint64_t offset) "%s read addr 0x%"PRIx64", size %d offset 0x%"PRIx64
++amdvi_command_error(uint64_t status) "error: Executing commands with command buffer disabled 0x%"PRIx64
++amdvi_command_read_fail(uint64_t addr, uint32_t head) "error: fail to access memory at 0x%"PRIx64" + 0x%"PRIu32
++amdvi_command_exec(uint32_t head, uint32_t tail, uint64_t buf) "command buffer head at 0x%"PRIx32 " command buffer tail at 0x%"PRIx32" command buffer base at 0x%" PRIx64
++amdvi_unhandled_command(uint8_t type) "unhandled command %d"
++amdvi_intr_inval(void) "Interrupt table invalidated"
++amdvi_iotlb_inval(void) "IOTLB pages invalidated"
++amdvi_prefetch_pages(void) "Pre-fetch of AMD-Vi pages requested"
++amdvi_pages_inval(uint16_t domid) "AMD-Vi pages for domain 0x%"PRIx16 " invalidated"
++amdvi_all_inval(void) "Invalidation of all AMD-Vi cache requested "
++amdvi_ppr_exec(void) "Execution of PPR queue requested "
++amdvi_devtab_inval(uint16_t bus, uint16_t slot, uint16_t func) "device table entry for devid: %02x:%02x.%x invalidated"
++amdvi_completion_wait(uint64_t addr, uint64_t data) "completion wait requested with store address 0x%"PRIx64" and store data 0x%"PRIx64
++amdvi_control_status(uint64_t val) "MMIO_STATUS state 0x%"PRIx64
++amdvi_iotlb_reset(void) "IOTLB exceed size limit - reset "
++amdvi_completion_wait_exec(uint64_t addr, uint64_t data) "completion wait requested with store address 0x%"PRIx64" and store data 0x%"PRIx64
++amdvi_dte_get_fail(uint64_t addr, uint32_t offset) "error: failed to access Device Entry devtab 0x%"PRIx64" offset 0x%"PRIx32
++amdvi_invalid_dte(uint64_t addr) "PTE entry at 0x%"PRIx64" is invalid "
++amdvi_get_pte_hwerror(uint64_t addr) "hardware error eccessing PTE at addr 0x%"PRIx64
++amdvi_mode_invalid(unsigned level, uint64_t addr)"error: translation level 0x%"PRIu8" translating addr 0x%"PRIx64
++amdvi_page_fault(uint64_t addr) "error: page fault accessing guest physical address 0x%"PRIx64
++amdvi_iotlb_hit(uint16_t bus, uint16_t slot, uint16_t func, uint64_t addr, uint64_t txaddr) "hit iotlb devid %02x:%02x.%x gpa 0x%"PRIx64 " hpa 0x%"PRIx64
++amdvi_translation_result(uint16_t bus, uint16_t slot, uint16_t func, uint64_t addr, uint64_t txaddr) "devid: %02x:%02x.%x gpa 0x%"PRIx64 " hpa 0x%"PRIx64
+
+f054366e2025c4ccffa5bc727917016f3de2bc0c - David Kiarie, Fri Jul 8 11:18:20 2016 +0300 : hw/pci: Prepare for AMD IOMMU
+diff --git a/include/hw/pci/pci.h b/include/hw/pci/pci.h
+index 929ec2f..5ff92de 100644
+--- a/include/hw/pci/pci.h
++++ b/include/hw/pci/pci.h
+@@ -11,11 +11,13 @@
+ #include "hw/pci/pcie.h"
+ 
+ /* PCI bus */
+-
+ #define PCI_DEVFN(slot, func)   ((((slot) & 0x1f) << 3) | ((func) & 0x07))
++#define PCI_BUS_NUM(x)          (((x) >> 8) & 0xff)
+ #define PCI_SLOT(devfn)         (((devfn) >> 3) & 0x1f)
+ #define PCI_FUNC(devfn)         ((devfn) & 0x07)
+ #define PCI_BUILD_BDF(bus, devfn)     ((bus << 8) | (devfn))
++#define PCI_BUS_MAX             256
++#define PCI_DEVFN_MAX           256
+ #define PCI_SLOT_MAX            32
+ #define PCI_FUNC_MAX            8
+ 
