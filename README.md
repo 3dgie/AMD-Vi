@@ -2,7 +2,7 @@
 
 After tonnes of blood, tears and sweat....
 
-I'm glad to have been working on Qemu AMD IOMMU emulation as part of GSoC and to have achieved most of what was planned, that is, both a working host translation implementation and a working interrupt remapping implementation. The code implementing this device is still under review and not yet merged into Qemu[1].
+I'm glad to have been working on Qemu AMD IOMMU emulation as part of GSoC and to have achieved most of what was planned, that is, both a working host translation implementation and a working interrupt remapping implementation. The code implementing this device is still under review and not yet merged into Qemu.
 
 ![](http://hotpepper.co.ke/content/images/2016/08/complete.png)
 
