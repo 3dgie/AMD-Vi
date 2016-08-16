@@ -34,7 +34,7 @@ This didn't turn out *so* easy.
 
 2. AMD IOMMU, while masquerading as a PCI device generates interrupts without being a BusMaster device(which is typical of PCI devices)
 
-![](http://hotpepper.co.ke/content/images/2016/08/busmaster-3.png)
+   ![](http://hotpepper.co.ke/content/images/2016/08/busmaster-3.png)
 
    IOMMU should generate an interrupt each time it logs an event which should include all hardware errors and page faults.
 
