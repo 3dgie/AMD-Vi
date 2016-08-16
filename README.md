@@ -190,7 +190,7 @@ which ensures that IOAPIC triggering interrupts in split irqchip mode is able to
 
 ##Why spend all this effort on a seemingly useless device ?
 
-##Good Question
+Good Question
 
 Interrupt remapping as an IOMMU feature enables interception, validation and delivery interrupts to specific CPUs. Interrupt remapping together with interrupt virtualization could bring performance improvements to guest VM but interrupt remapping alone is supposed to provide device isolation, compatibility with x2apic and could possibly be used to program a different route for delivery of an interrupt.
 
