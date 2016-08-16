@@ -44,7 +44,6 @@ _huh_ ? _sounds like AMD is hating on Qemu_
 
 The working Qemu AMD IOMMU setup implements a composite PCI/Platform device similar to the stripped down device below.
 
-'''C
     #include "qemu/osdep.h"
     #include "hw/pci/pci.h"
     #include "hw/i386/x86-iommu.h"
@@ -53,7 +52,7 @@ The working Qemu AMD IOMMU setup implements a composite PCI/Platform device simi
     #include "hw/sysbus.h"
     #include "qom/object.h"
     #include "hw/i386/pc.h"
-'''C
+    
     #define AMDVI_MMIO_SIZE        0x4000
     #define AMDVI_CAPAB_SIZE       0x18
     #define AMDVI_CAPAB_REG_SIZE   0x04
