@@ -22,15 +22,15 @@ This didn't turn out *so* easy.
 
 ##how come?!?
 
-1 IOMMU masquerades as a PCI device by stealing PCI config space so that the Software driver is able to communicate with it as with     any other PCI device while it's not really a PCI device.
+1. IOMMU masquerades as a PCI device by stealing PCI config space so that the Software driver is able to communicate with it as with     any other PCI device while it's not really a PCI device.
 
    _3.1 PCI Resources_ 
 
-  _The IOMMU is implemented as an independent PCI Function. Any PCI Function containing an IOMMU capability block cannot be used for any purpose other than containing an IOMMU. A PCI Function containing an IOMMU capability block does not include PCI BAR registers. Configuration and status information for the IOMMU are mapped into PCI configuration space using a PCI capability block._"  - *AMD IOMMU Spec*
+   _The IOMMU is implemented as an independent PCI Function. Any PCI Function containing an IOMMU capability block cannot be used for any purpose other than containing an IOMMU. A PCI Function containing an IOMMU capability block does not include PCI BAR registers. Configuration and status information for the IOMMU are mapped into PCI configuration space using a PCI capability block._"  - *AMD IOMMU Spec*
 
-  (Someone actually pointed this out, for me ;-p)
+   (Someone actually pointed this out, for me ;-p)
 
-  The above becomes evident since IOMMU reserves MMIO region without a BAR register. This feature was particularly hard to emulate in Qemu since it only supports either purely PCI devices or platform devices(system bus devices).
+   The above becomes evident since IOMMU reserves MMIO region without a BAR register. This feature was particularly hard to emulate in Qemu since it only supports either purely PCI devices or platform devices(system bus devices).
 
 2. AMD IOMMU, while masquerading as a PCI device generates interrupts without being a BusMaster device(which is typical of PCI devices)
 
