@@ -2,7 +2,7 @@
 
 After tonnes of blood, tears and sweat....
 
-I'm glad to have been working on Qemu AMD IOMMU emulation and have achieved most of what was planned, that is, both a working host translation implementation and a working interrupt remapping implementation though it has not been merged upstream. ;-D
+I'm glad to have been working on Qemu AMD IOMMU emulation as part of GSoC and to have achieved most of what was planned, that is, both a working host translation implementation and a working interrupt remapping implementation. The code implementing this device is still under review and not yet merged into Qemu[1].
 
 ![](http://hotpepper.co.ke/content/images/2016/08/complete.png)
 
@@ -191,6 +191,8 @@ which ensures that IOAPIC triggering interrupts in split irqchip mode is able to
 ##Why spend all this effort on a seemingly useless device ?
 
 Good Question
+
+Am impressive proposal for using Virtual IOMMU for inter-VM communication can be accessed here https://wiki.opnfv.org/display/kvm/Vm2vm+Mst
 
 Interrupt remapping as an IOMMU feature enables interception, validation and delivery interrupts to specific CPUs. Interrupt remapping together with interrupt virtualization could bring performance improvements to guest VM but interrupt remapping alone is supposed to provide device isolation, compatibility with x2apic and could possibly be used to program a different route for delivery of an interrupt.
 
