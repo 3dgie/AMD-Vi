@@ -20,7 +20,7 @@ IOMMU is a device that sits between host bridge and peripherals allowing them to
 
 This didn't turn out *so* easy.
 
-***how come?!?***
+##how come?!?
 
 -IOMMU masquerades as a PCI device by stealing PCI config space so that the Software driver is able to communicate with it as with any other PCI device while it's not really a PCI device.
 
@@ -169,7 +169,7 @@ The above design solves two problems one being we're able to inherit from Qemu X
 
 The above code solves the lack of BusMaster capability on AMD IOMMU by writing interrupts directly to system address space
 
-Lastly, the Platform device issue was solved by affiliating x86 MSI route which was initially
+Lastly, the Platform device issue was solved by affiliating x86 MSI route, which was initially
 
      struct MSIRouteEntry {
          PCIDevice *dev;             /* Device pointer */
@@ -178,7 +178,7 @@ Lastly, the Platform device issue was solved by affiliating x86 MSI route which 
         QLIST_ENTRY(MSIRouteEntry) list;
       };
 
-to
+with a MSI Requester ID to have
 
      struct MSIRouteEntry {
          PCIDevice *dev;             /* Device pointer */
@@ -188,6 +188,6 @@ to
         QLIST_ENTRY(MSIRouteEntry) list;
       };
 
-with a Requester ID which ensures that IOAPIC triggering interrupts in split irqchip mode is able to tell the IOMMU it's SID.
+which ensures that IOAPIC triggering interrupts in split irqchip mode is able to tell the IOMMU it's SID and so would any other platform device.
 
 _And may be something else I forgot ?_
