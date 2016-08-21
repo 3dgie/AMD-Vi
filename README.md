@@ -44,6 +44,7 @@ This didn't turn out *so* easy.
 
 The working Qemu AMD IOMMU setup implements a composite PCI/Platform device similar to the stripped down device below.
 
+```c
     #include "qemu/osdep.h"
     #include "hw/pci/pci.h"
     #include "hw/i386/x86-iommu.h"
@@ -152,9 +153,12 @@ The working Qemu AMD IOMMU setup implements a composite PCI/Platform device simi
     }
 
     type_init(amdviPCI_register_types);
+   
+```
 
 The above design solves two problems one being we're able to inherit from Qemu X86 IOMMU class (which is implemented as Platform device) and the other being we're able to reserve MMIO region for like any other Platform device hence avoiding the need for a BAR register.
 
+```c
      static void amdvi_generate_msi_interrupt(AMDVIState *s)
      {
           MSIMessage msg;
@@ -164,10 +168,13 @@ The above design solves two problems one being we're able to inherit from Qemu X
                          MEMTXATTRS_UNSPECIFIED, NULL);
         }
     }
+```
 
 The above code solves the lack of BusMaster capability on AMD IOMMU by writing interrupts directly to system address space
 
 Lastly, the Platform device issue was solved by affiliating x86 MSI route, which was initially
+
+```c
 
      struct MSIRouteEntry {
          PCIDevice *dev;             /* Device pointer */
@@ -175,6 +182,7 @@ Lastly, the Platform device issue was solved by affiliating x86 MSI route, which
          int virq;                   /* Virtual IRQ index */
         QLIST_ENTRY(MSIRouteEntry) list;
       };
+```
 
 with a MSI Requester ID to have
 ```c
