@@ -177,7 +177,7 @@ Lastly, the Platform device issue was solved by affiliating x86 MSI route, which
       };
 
 with a MSI Requester ID to have
-
+```c
      struct MSIRouteEntry {
          PCIDevice *dev;             /* Device pointer */
          uint16_t requester_id;      /* Requesting SID */
@@ -185,7 +185,7 @@ with a MSI Requester ID to have
          int virq;                   /* Virtual IRQ index */
         QLIST_ENTRY(MSIRouteEntry) list;
       };
-
+```
 which ensures that IOAPIC triggering interrupts in split irqchip mode is able to tell the IOMMU it's SID and so would any other platform device.
 
 ##Why spend all this effort on a seemingly useless device ?
@@ -201,3 +201,11 @@ Device isolation allows the handing over of device to unprivileged users since w
 It’s a requirement from intel that with x2apic enabled peripheral interrupts should be delivered through interrupt remapping and lastly It _could_ be possible to reroute interrupts without reconfiguring the interrupt source by modifying the Interrupt remapping table since it contains all the information relating to routing interrupts related to a certain device. This could avoid the messy process of rerouting interrupts.
 
 _And may be something else I forgot ?_
+
+##how can I test this device
+
+Quickly grab the code at https://github.com/aslaq/qemu IR
+
+    $qemu-system-x86_64 -device amd-iommu 
+   
+should start Qemu with the device emulated. 
