@@ -214,6 +214,6 @@ _And may be something else I forgot ?_
 
 Quickly grab the code at https://github.com/aslaq/qemu IR
 
-    $qemu-system-x86_64 -device amd-iommu 
+    $qemu-system-x86_64 -M q35,kernel_irqchip={split|off} -device amd-iommu 
    
 should start Qemu with the device emulated. 
