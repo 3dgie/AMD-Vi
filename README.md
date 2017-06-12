@@ -4,7 +4,7 @@ After tonnes of blood, tears and sweat....
 
 I'm glad to have been working on Qemu AMD IOMMU emulation as part of GSoC and to have achieved most of what was planned, that is, both a working host translation implementation and a working interrupt remapping implementation. The code implementing this device is still under review and not yet merged into Qemu.
 
-![](http://hotpepper.co.ke/content/images/2016/08/complete.png)
+![](https://raw.githubusercontent.com/aslaq/AMD-Vi/master/first.png)
 
 *So*, *what now??* - *nothing, really*
 
@@ -12,7 +12,7 @@ I'm glad to have been working on Qemu AMD IOMMU emulation as part of GSoC and to
 
 IOMMU is a device that sits between host bridge and peripherals allowing them to make I/O requests by-passing the need to request CPU for access permissions. This allows user-space application to take full control of devices a.k.a device pass-through and is hence an important feature for virtualization.
 
-![](http://hotpepper.co.ke/content/images/2016/08/2016-08-02-180438_1366x768_scrot.png)
+![](https://raw.githubusercontent.com/aslaq/AMD-Vi/master/second.png)
 
 *1.2.6  Virtualizing the IOMMU*
 
