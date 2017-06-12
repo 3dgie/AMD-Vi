@@ -33,9 +33,6 @@ This didn't turn out *so* easy.
    The above becomes evident since IOMMU reserves MMIO region without a BAR register. This feature was particularly hard to emulate in Qemu since it only supports either purely PCI devices or platform devices(system bus devices).
 
 2. AMD IOMMU, while masquerading as a PCI device generates interrupts without being a BusMaster device(which is typical of PCI devices)
-
-   ![](http://hotpepper.co.ke/content/images/2016/08/busmaster-3.png)
-
    IOMMU should generate an interrupt each time it logs an event which should include all hardware errors and page faults.
 
 3. IOMMUs(including AMD IOMMU) use device source ID (which should be same as BDF) to index _device table_ and other informational data    structures in-order to make decisions on access rights and remap interrupts. Platform devices like HPET and IOAPIC don't make         DMArequests, at least as long as Qemu is concerned which means that the DMA part of IOMMU can be completed without any problem.       These devices are however major interrupt sources in a system which means the interrupt remapping work is a bit tricky. Interrupt     requests should be accompanied by information identifying the device and the nature of the interrupt requests. Included in this       information is the Requester ID which is basically the Bus Device Function(BDF) when PCI devices are concerned. Platform devices      which want to make interrupt requests should report the BDF that will accompany their interrupt requests. The problem comes in        because platform devices, in Qemu currently make interrupt requests using unspecified attributes meaning unspecified requester ID.
