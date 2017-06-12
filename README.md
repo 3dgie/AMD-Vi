@@ -20,7 +20,7 @@ IOMMU is a device that sits between host bridge and peripherals allowing them to
 
 This didn't turn out *so* easy.
 
-##how come?!?
+## how come?!?
 
 1. IOMMU masquerades as a PCI device by stealing PCI config space so that the Software driver is able to communicate with it as with     any other PCI device while it's not really a PCI device.
 
