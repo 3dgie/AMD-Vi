@@ -210,7 +210,7 @@ It’s a requirement from intel that with x2apic enabled peripheral interrupts s
 
 _And may be something else I forgot ?_
 
-##how can I test this device
+## how can I test this device
 
 Quickly grab the code at https://github.com/aslaq/qemu IR
 
