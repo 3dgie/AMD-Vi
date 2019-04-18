@@ -1,4 +1,5 @@
-# AMD-Vi
+                                                                                 AMD-Vi
+                                                                               ==========
 
 After tonnes of blood, tears and sweat....
 
@@ -6,21 +7,23 @@ I'm glad to have been working on Qemu AMD IOMMU emulation as part of GSoC and to
 
 ![](https://raw.githubusercontent.com/aslaq/AMD-Vi/master/first.png)
 
-*So*, *what now??* - *nothing, really*
+ - So, what now?? - nothing, really
 
-**IOMMU TOPOLOGY**
+IOMMU TOPOLOGY
+=================
 
 IOMMU is a device that sits between host bridge and peripherals allowing them to make I/O requests by-passing the need to request CPU for access permissions. This allows user-space application to take full control of devices a.k.a device pass-through and is hence an important feature for virtualization.
 
 ![](https://raw.githubusercontent.com/aslaq/AMD-Vi/master/second.png)
 
-*1.2.6  Virtualizing the IOMMU*
+1.2.6  Virtualizing the IOMMU
+===============================
 
- *The IOMMU has been designed so that it can be   emulated in  software by a VMM that wishes to present its VM guests the illusion that they have an IOMMU*   - *AMD IOMMU Specification*
+  - The IOMMU has been designed so that it can be emulated in software by a VMM that wishes to present its VM guests the illusion that they have an IOMMU*   - *AMD IOMMU Specification*
 
 This didn't turn out *so* easy.
 
-## how come?!?
+ how come?!?
 
 1. IOMMU masquerades as a PCI device by stealing PCI config space so that the Software driver is able to communicate with it as with     any other PCI device while it's not really a PCI device.
 
@@ -41,7 +44,6 @@ This didn't turn out *so* easy.
 
 The working Qemu AMD IOMMU setup implements a composite PCI/Platform device similar to the stripped down device below.
 
-```c
     #include "qemu/osdep.h"
     #include "hw/pci/pci.h"
     #include "hw/i386/x86-iommu.h"
@@ -151,11 +153,9 @@ The working Qemu AMD IOMMU setup implements a composite PCI/Platform device simi
 
     type_init(amdviPCI_register_types);
    
-```
 
 The above design solves two problems one being we're able to inherit from Qemu X86 IOMMU class (which is implemented as Platform device) and the other being we're able to reserve MMIO region for like any other Platform device hence avoiding the need for a BAR register.
 
-```c
      static void amdvi_generate_msi_interrupt(AMDVIState *s)
      {
           MSIMessage msg;
@@ -165,13 +165,11 @@ The above design solves two problems one being we're able to inherit from Qemu X
                          MEMTXATTRS_UNSPECIFIED, NULL);
         }
     }
-```
 
 The above code solves the lack of BusMaster capability on AMD IOMMU by writing interrupts directly to system address space
 
 Lastly, the Platform device issue was solved by affiliating x86 MSI route, which was initially
 
-```c
 
      struct MSIRouteEntry {
          PCIDevice *dev;             /* Device pointer */
@@ -179,10 +177,8 @@ Lastly, the Platform device issue was solved by affiliating x86 MSI route, which
          int virq;                   /* Virtual IRQ index */
         QLIST_ENTRY(MSIRouteEntry) list;
       };
-```
 
 with a MSI Requester ID to have
-```c
      struct MSIRouteEntry {
          PCIDevice *dev;             /* Device pointer */
          uint16_t requester_id;      /* Requesting SID */
@@ -190,10 +186,10 @@ with a MSI Requester ID to have
          int virq;                   /* Virtual IRQ index */
         QLIST_ENTRY(MSIRouteEntry) list;
       };
-```
 which ensures that IOAPIC triggering interrupts in split irqchip mode is able to tell the IOMMU it's SID and so would any other platform device.
 
-##Why spend all this effort on a seemingly useless device ?
+Why spend all this effort on a seemingly useless device ?
+=============================================================
 
 Good Question
 
@@ -207,7 +203,8 @@ It’s a requirement from intel that with x2apic enabled peripheral interrupts s
 
 _And may be something else I forgot ?_
 
-## how can I test this device
+how can I test this device
+==============================
 
 Quickly grab the code at https://github.com/aslaq/qemu IR
 
